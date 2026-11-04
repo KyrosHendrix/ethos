@@ -184,11 +184,11 @@ else {
       minWidth: 960,
       minHeight: 680,
       title: "ethos",
-      backgroundColor: "#f5f4f1",
+      backgroundColor: "#f6f6f4",
       titleBarStyle: "hidden",
       icon: process.env.ELECTRON_RENDERER_URL
         ? path.join(app.getAppPath(), "build/icon.ico")
-        : path.join(import.meta.dirname, "../renderer/ethos.png"),
+        : path.join(import.meta.dirname, "../renderer/ethos.ico"),
       trafficLightPosition: { x: 18, y: 18 },
       webPreferences: {
         preload: path.join(import.meta.dirname, "../preload/index.cjs"),

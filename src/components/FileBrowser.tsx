@@ -178,7 +178,13 @@ export function FileBrowser(props: Props) {
               key={location.name}
               type="button"
               disabled={busy}
-              className={location.path === listing.path ? "active" : ""}
+              className={
+                // Known folders can share a path (e.g. Documents redirected to D:\); mark only the first.
+                location ===
+                listing.locations.find((item) => item.path === listing.path)
+                  ? "active"
+                  : ""
+              }
               onClick={() => void navigate(location.path)}
             >
               {location.name.endsWith(":") ? (

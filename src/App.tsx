@@ -5,7 +5,6 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUpRight,
-  BookOpen,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -16,7 +15,6 @@ import {
   Highlighter,
   Keyboard,
   LayoutGrid,
-  List,
   LoaderCircle,
   Maximize,
   Minus,
@@ -140,9 +138,11 @@ export function App() {
   const [recent, setRecent] = useState<RecentFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [toast, setToast] = useState<{ text: string; error: boolean } | null>(
-    null,
-  );
+  const [toast, setToast] = useState<{
+    text: string;
+    error: boolean;
+    undoable?: boolean;
+  } | null>(null);
   const [sidebar, setSidebar] = useState(true);
   const [tab, setTab] = useState<"pages" | "notes" | "search">("pages");
   const [page, setPage] = useState(1);
@@ -375,6 +375,7 @@ export function App() {
     setHistory({ past: [], present: empty, future: [] });
     setDoc(null);
     setQuery("");
+    setToast(null);
     window.ethos.setDirty(false);
     document.title = "ethos";
   }
@@ -431,6 +432,8 @@ export function App() {
   }
 
   function undo() {
+    // An undo prompt is stale once the user has undone.
+    setToast((current) => (current?.undoable ? null : current));
     setHistory((old) =>
       old.past.length
         ? {
@@ -632,28 +635,47 @@ export function App() {
           onClick={() => void closeDocument()}
           aria-label="Return to library"
         >
-          <MarkLogo size={25} />
+          <MarkLogo size={22} />
           <span>ethos</span>
         </button>
-        <div className="titlebar-center">
-          {doc ? (
-            <>
-              <FileText size={12} />
-              <span>{doc.name}</span>
-              {dirty && (
-                <Hint label="Unsaved changes">
-                  <span
-                    className="dirty-dot"
-                    aria-label="Unsaved changes"
-                    tabIndex={0}
-                  />
-                </Hint>
-              )}
-            </>
-          ) : (
-            <span>Your document workspace</span>
-          )}
-        </div>
+        {doc && (
+          <>
+            <IconButton
+              label="Toggle sidebar"
+              active={sidebar}
+              onClick={() => setSidebar(!sidebar)}
+            >
+              <PanelLeft size={17} />
+            </IconButton>
+            <div className="document-heading">
+              <span>{doc.name.replace(/\.pdf$/i, "")}</span>
+              <small>
+                {dirty && <span className="dirty-dot" />}
+                {dirty ? "Edited" : "PDF document"}
+              </small>
+            </div>
+            <div className="titlebar-actions">
+              <IconButton
+                label={dark ? "Use light appearance" : "Use dark appearance"}
+                onClick={() => setDark(!dark)}
+              >
+                {dark ? <Sun size={16} /> : <Moon size={16} />}
+              </IconButton>
+              <button
+                className="primary-button save-button"
+                disabled={saving || loading}
+                onClick={() => void save()}
+              >
+                {saving ? (
+                  <LoaderCircle size={14} className="spin" />
+                ) : (
+                  <ArrowDownToLine size={14} />
+                )}
+                <span>{saving ? "Saving…" : "Save copy"}</span>
+              </button>
+            </div>
+          </>
+        )}
         <div className="window-controls">
           <button
             aria-label="Minimize window"
@@ -680,8 +702,7 @@ export function App() {
         {!doc ? (
           <>
             <aside className="library-sidebar">
-              <div className="sidebar-topline">WORKSPACE</div>
-              <button className="nav-item selected">
+              <button className="nav-item selected" aria-current="page">
                 <LayoutGrid size={16} />
                 Library<span className="nav-count">{recent.length}</span>
               </button>
@@ -689,7 +710,7 @@ export function App() {
                 <FolderOpen size={16} />
                 Open document<kbd>Ctrl O</kbd>
               </button>
-              <div className="sidebar-recent-heading">RECENT DOCUMENTS</div>
+              <div className="sidebar-recent-heading">Recents</div>
               <div className="recent-nav">
                 {recent.length ? (
                   recent.map((item) => (
@@ -699,11 +720,7 @@ export function App() {
                     </button>
                   ))
                 ) : (
-                  <p>
-                    The documents you open
-                    <br />
-                    will appear here.
-                  </p>
+                  <p>Documents you open will appear here.</p>
                 )}
               </div>
               <div className="sidebar-bottom">
@@ -733,26 +750,18 @@ export function App() {
               </div>
             </aside>
             <main className="welcome">
-              <div className="welcome-top">
-                <span>Library</span>
-                <button className="subtle-button" onClick={() => void open()}>
-                  <Plus size={15} />
-                  Open PDF
-                </button>
-              </div>
               <div className="welcome-content">
                 <div className="welcome-icon">
-                  <MarkLogo size={50} />
+                  <MarkLogo size={56} />
                 </div>
-                <div className="eyebrow">A LITTLE MORE ROOM TO THINK</div>
                 <h1>
                   Your documents.
                   <br />
                   <span>Your space.</span>
                 </h1>
                 <p className="welcome-description">
-                  Read closely. Make your mark.
-                  <br />A quieter way to work with PDFs.
+                  Read closely. Make your mark. A quieter way to work with
+                  PDFs.
                 </p>
                 <div
                   className="open-card"
@@ -767,38 +776,22 @@ export function App() {
                   }}
                 >
                   <div className="open-card-icon">
-                    <FilePlus2 size={25} strokeWidth={1.4} />
+                    <FilePlus2 size={24} strokeWidth={1.5} />
                   </div>
                   <div>
-                    <strong>Bring a document into focus</strong>
-                    <p>Drop a PDF here, or browse your files</p>
+                    <strong>Open a PDF</strong>
+                    <p>Drop a file anywhere in this window, or browse.</p>
                   </div>
-                  <span className="primary-button">
-                    Open PDF <ArrowUpRight size={15} />
-                  </span>
+                  <span className="primary-button">Browse…</span>
                 </div>
                 <button className="sample-link" onClick={() => void sample()}>
-                  Or take a look around with a sample document{" "}
+                  Or take a look around with a sample document
                   <ArrowRight size={14} />
                 </button>
-                <div className="welcome-details">
-                  <span>
-                    <BookOpen size={14} />
-                    Read without distractions
-                  </span>
-                  <span>
-                    <PenLine size={14} />
-                    Make it yours
-                  </span>
-                </div>
                 {recent.length > 0 && (
                   <section className="recent-section">
                     <div>
                       <h2>Pick up where you left off</h2>
-                      <span>
-                        {recent.length} recent{" "}
-                        {recent.length === 1 ? "document" : "documents"}
-                      </span>
                     </div>
                     <div className="recent-cards">
                       {recent.slice(0, 3).map((item) => (
@@ -823,10 +816,6 @@ export function App() {
                   </section>
                 )}
               </div>
-              <footer className="welcome-footer">
-                <span>Made for the way you think.</span>
-                <span>Local files. No ethos account.</span>
-              </footer>
             </main>
           </>
         ) : (
@@ -854,13 +843,8 @@ export function App() {
                   role="tablist"
                   aria-label="Document navigation"
                 >
-                  {(
-                    [
-                      ["pages", LayoutGrid],
-                      ["notes", List],
-                      ["search", Search],
-                    ] satisfies [typeof tab, typeof LayoutGrid][]
-                  ).map(([name, Icon]) => (
+                  {(["pages", "notes", "search"] satisfies (typeof tab)[]).map(
+                    (name) => (
                     <button
                       key={name}
                       role="tab"
@@ -903,7 +887,6 @@ export function App() {
                           );
                       }}
                     >
-                      <Icon size={14} />
                       {name[0].toUpperCase() + name.slice(1)}
                       {name === "notes" && !!visibleMarks.length && (
                         <span>{visibleMarks.length}</span>
@@ -932,7 +915,7 @@ export function App() {
                   {tab === "notes" && (
                     <div className="notes-list">
                       <div className="section-caption">
-                        YOUR ANNOTATIONS <span>{visibleMarks.length}</span>
+                        Annotations <span>{visibleMarks.length}</span>
                       </div>
                       {visibleMarks.length ? (
                         visibleMarks.map((mark) => (
@@ -1020,8 +1003,15 @@ export function App() {
                       )}
                       {query.trim() && !searching && (
                         <p className="search-status">
-                          {hits.reduce((sum, hit) => sum + hit.count, 0)}{" "}
-                          matches in {hits.length} pages
+                          {(() => {
+                            const total = hits.reduce(
+                              (sum, hit) => sum + hit.count,
+                              0,
+                            );
+                            return total
+                              ? `${total} ${total === 1 ? "match" : "matches"} on ${hits.length} ${hits.length === 1 ? "page" : "pages"}`
+                              : "No matches";
+                          })()}
                         </p>
                       )}
                       {hits.map((hit) => (
@@ -1056,50 +1046,14 @@ export function App() {
                 <div className="document-sidebar-footer">
                   <span>{edits.pages.length} pages</span>
                   <span>
-                    {(doc.bytes.byteLength / 1024 / 1024).toFixed(1)} MB
+                    {doc.bytes.byteLength < 1024 * 1024
+                      ? `${Math.max(1, Math.round(doc.bytes.byteLength / 1024))} KB`
+                      : `${(doc.bytes.byteLength / 1024 / 1024).toFixed(1)} MB`}
                   </span>
                 </div>
               </aside>
             )}
             <main className="reader">
-              <div className="reader-toolbar">
-                <div className="toolbar-start">
-                  <IconButton
-                    label="Toggle sidebar"
-                    active={sidebar}
-                    onClick={() => setSidebar(!sidebar)}
-                  >
-                    <PanelLeft size={18} />
-                  </IconButton>
-                  <span className="toolbar-divider" />
-                  <div className="document-heading">
-                    <span>{doc.name.replace(/\.pdf$/i, "")}</span>
-                    <small>{dirty ? "Unsaved changes" : "PDF document"}</small>
-                  </div>
-                </div>
-                <div className="toolbar-end">
-                  <IconButton
-                    label={
-                      dark ? "Use light appearance" : "Use dark appearance"
-                    }
-                    onClick={() => setDark(!dark)}
-                  >
-                    {dark ? <Sun size={16} /> : <Moon size={16} />}
-                  </IconButton>
-                  <button
-                    className="primary-button save-button"
-                    disabled={saving || loading}
-                    onClick={() => void save()}
-                  >
-                    {saving ? (
-                      <LoaderCircle size={15} className="spin" />
-                    ) : (
-                      <ArrowDownToLine size={15} />
-                    )}
-                    <span>{saving ? "Saving…" : "Save copy"}</span>
-                  </button>
-                </div>
-              </div>
               <div
                 className="document-scroll"
                 ref={scroll}
@@ -1256,7 +1210,11 @@ export function App() {
                         ),
                       }));
                       setPage(Math.min(page, edits.pages.length - 1));
-                      notify("Page removed. Undo to bring it back.");
+                      setToast({
+                        text: "Page removed.",
+                        error: false,
+                        undoable: true,
+                      });
                     }}
                   >
                     <Trash2 size={14} />
@@ -1336,6 +1294,11 @@ export function App() {
             <Check size={16} />
           )}
           <span>{toast.text}</span>
+          {toast.undoable && (
+            <button className="text-button" onClick={undo}>
+              Undo
+            </button>
+          )}
           <IconButton label="Dismiss message" onClick={() => setToast(null)}>
             <X size={14} />
           </IconButton>
