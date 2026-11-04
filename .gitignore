@@ -1,0 +1,6 @@
+node_modules/
+out/
+release/
+artifacts/
+public/pdf-assets/
+*.log

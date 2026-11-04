@@ -1,0 +1,68 @@
+{
+  "name": "ethos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A considered space for your documents",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "assets": "node scripts/assets.mjs",
+    "predev": "npm run assets",
+    "prebuild": "npm run assets",
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && electron-vite build",
+    "test": "node --test tests/*.test.mjs",
+    "test:e2e": "npm run build && node scripts/smoke.mjs",
+    "dist": "npm run build && electron-builder --win nsis --publish never"
+  },
+  "build": {
+    "appId": "app.ethos.reader",
+    "productName": "ethos",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF document",
+        "role": "Editor"
+      }
+    ]
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.68.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438",
+    "radix-ui": "^1.8.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "electron": "^45.2.2",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^6.0.0",
+    "playwright-core": "^1.64.1",
+    "prettier": "^3.9.10",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
