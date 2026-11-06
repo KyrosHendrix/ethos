@@ -606,7 +606,29 @@ mod tests {
 
     #[test]
     fn redaction_removes_form_values_and_appearances() {
-        let source = crate::forms::tests::form_fixture();
+        let mut form = Document::load_mem(&crate::forms::tests::form_fixture()).unwrap();
+        crate::forms::apply_fields(
+            &mut form,
+            &[ethos_core::FieldValue {
+                name: "name".into(),
+                value: "Secret appearance".into(),
+            }],
+        )
+        .unwrap();
+        let secret = b"53656372657420617070656172616e6365";
+        let appearance = form
+            .objects
+            .iter()
+            .find_map(|(id, object)| {
+                let stream = object.as_stream().ok()?;
+                stream
+                    .content
+                    .windows(secret.len())
+                    .any(|part| part == secret)
+                    .then_some(*id)
+            })
+            .expect("the source must contain a secret-bearing appearance stream");
+        let source = serialize(&mut form).unwrap();
         let engine = engine();
         let bytes = source.clone();
         let redacted = engine
@@ -628,6 +650,19 @@ mod tests {
             })
             .unwrap();
         let document = Document::load_mem(&redacted).unwrap();
+        assert!(!document.objects.contains_key(&appearance));
+        assert!(
+            document
+                .objects
+                .values()
+                .filter_map(|object| object.as_stream().ok())
+                .all(|stream| {
+                    let content = stream
+                        .decompressed_content()
+                        .unwrap_or_else(|_| stream.content.clone());
+                    !content.windows(secret.len()).any(|part| part == secret)
+                })
+        );
         assert!(!document.catalog().unwrap().has(b"AcroForm"));
         assert!(
             !document
