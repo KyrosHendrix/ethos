@@ -1,6 +1,4 @@
-node_modules/
-out/
-release/
-artifacts/
-public/pdf-assets/
+target/
+ui/dist/
+src-tauri/gen/
 *.log

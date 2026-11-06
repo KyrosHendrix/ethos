@@ -1,11 +1,17 @@
 # ethos identity
 
-Approved direction: **A, Margin**, in **Forest**.
+The approved mark is **01, Rising knot**: an ascending white ribbon with two elongated loops on a red square. The symbol is abstract and contains no letter or monogram.
 
-The mark separates a vertical page margin from three text lines to form an E. The shorter middle line preserves recognition at toolbar sizes.
+The original approved artwork lives in `src-tauri/icons/rising-knot.png`. It is the source for every app icon. The generator applies a superellipse mask with transparent corners, preserving the ribbon's shape and colors.
 
-- Forest: `#284d3c`
-- Paper: `#faf9f4`
-- Wordmark: lowercase `ethos`, using the app's system sans serif.
+App accents use red `#b90d00` in light mode and coral `#ff9a90` in dark mode for readable controls against dark surfaces. Neutral backgrounds keep the documents in focus.
 
-`scripts/create-icon.py` is the source of the mark's geometry: a superellipse tile with a top-lit forest gradient. It writes `public/ethos.svg`, `public/ethos.png`, `public/ethos.ico` and `build/icon.{png,ico}`, rendering each `.ico` frame (16 to 256 px) on its own pixel grid so the bars stay crisp on the taskbar at every display scale. Run `python scripts/create-icon.py` to regenerate them. This command only generates artwork; it does not build or package the app.
+Run `cargo run -p create-icon` from the repository root to regenerate the assets:
+
+- `ui/public/ethos.svg`, used by the app and favicon, embeds the rounded PNG. It is an SVG container, not vector artwork.
+- `ui/public/ethos.png` and `src-tauri/icons/icon.png` are 512 px PNGs.
+- `ui/public/ethos.ico` and `src-tauri/icons/icon.ico` contain 14 sizes, from 16 to 256 px, for Windows display scales and packaging.
+
+The generator checks that each ICO holds all 14 frames, and that every frame has transparent corners and an opaque center. It only generates artwork and does not build, package or launch the app.
+
+The wordmark remains lowercase `ethos` in the app's system sans serif.

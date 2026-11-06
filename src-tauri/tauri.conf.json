@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ethos",
+  "version": "0.1.0",
+  "identifier": "app.ethos.reader",
+  "build": {
+    "beforeDevCommand": { "script": "trunk serve", "cwd": "../ui" },
+    "beforeBuildCommand": { "script": "trunk build --release", "cwd": "../ui" },
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "ethos",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 960,
+        "minHeight": 680,
+        "center": true,
+        "decorations": false,
+        "dragDropEnabled": false,
+        "shadow": true,
+        "backgroundColor": "#f6f6f4"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "resources": { "pdfium/pdfium.dll": "pdfium.dll", "pdfium/LICENSE": "pdfium-LICENSE.txt" },
+    "fileAssociations": [
+      { "ext": ["pdf"], "name": "PDF document", "description": "PDF document", "role": "Editor" }
+    ],
+    "windows": {
+      "nsis": { "installMode": "currentUser", "installerIcon": "icons/icon.ico" }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "ethos-engine"
+description = "PDF parsing, rendering, search and export for ethos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ethos-core.workspace = true
+lopdf = { version = "0.40", default-features = false }
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }

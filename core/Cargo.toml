@@ -1,0 +1,8 @@
+[package]
+name = "ethos-core"
+description = "Types and pure logic shared by the ethos interface and native engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true

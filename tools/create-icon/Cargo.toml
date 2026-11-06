@@ -1,0 +1,9 @@
+[package]
+name = "create-icon"
+description = "Generates ethos icons from the approved Rising knot artwork"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }

@@ -1,0 +1,33 @@
+[package]
+name = "ethos"
+description = "A considered space for your documents"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Replaces native file dialogs with scripted answers for the end-to-end test.
+e2e = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dunce = "1"
+ethos-core.workspace = true
+ethos-engine.workspace = true
+rusty-leveldb = "4.0.2"
+same-file = "1"
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = "0.62"
+
+[dev-dependencies]
+lopdf = { version = "0.40", default-features = false }
+tungstenite = "0.26"
