@@ -333,6 +333,7 @@ pub fn apply_redactions(
             .iter()
             .map(|target| target.number)
             .collect::<Vec<_>>(),
+        progress,
     )?;
     for (index, target) in targets.iter().enumerate() {
         if !progress(index as u32, targets.len() as u32) {
@@ -604,6 +605,7 @@ mod tests {
         }
     }
 
+    /// The saved production output must omit form values and their appearance objects.
     #[test]
     fn redaction_removes_form_values_and_appearances() {
         let mut form = Document::load_mem(&crate::forms::tests::form_fixture()).unwrap();

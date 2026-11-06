@@ -130,6 +130,7 @@ impl AuxiliaryFiles {
 }
 
 impl Drop for AuxiliaryFiles {
+    /// Deletes only files created by an export whose main write did not complete.
     fn drop(&mut self) {
         for path in &self.0 {
             let _ = fs::remove_file(path);
