@@ -132,7 +132,10 @@ pub fn to_text(pages: &[Vec<Block>]) -> String {
 }
 
 fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
+    text.chars()
+        .filter(|&c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..))
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -387,5 +390,19 @@ mod tests {
         assert!(document.contains("<w:tbl>"));
         assert!(document.contains(r#"r:embed="rIdImage1""#));
         assert!(part(&docx, "word/_rels/document.xml.rels").contains("media/image1.png"));
+    }
+
+    #[test]
+    fn word_export_removes_forbidden_xml_characters() {
+        let text = "Valid\ttext\n\r & < > \" café 🦀\u{2}\u{c}\u{fffe}\u{ffff}";
+        let blocks = vec![vec![Block::Paragraph {
+            spans: vec![span(text, false)],
+        }]];
+        let docx = to_docx(&blocks).unwrap();
+        let xml = part(&docx, "word/document.xml");
+        roxmltree::Document::parse(&xml).unwrap();
+        assert!(xml.contains("café 🦀"));
+        assert!(xml.contains("&amp; &lt; &gt; &quot;"));
+        assert!(!xml.contains(['\u{2}', '\u{c}', '\u{fffe}', '\u{ffff}']));
     }
 }

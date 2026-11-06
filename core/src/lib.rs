@@ -124,12 +124,18 @@ pub struct FieldValue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum FieldKind {
     Text { multiline: bool },
     Check { on: String },
     Radio { on: String },
-    Choice { options: Vec<String> },
+    Choice { options: Vec<ChoiceOption> },
 }
 
 /// One fillable widget on a page.

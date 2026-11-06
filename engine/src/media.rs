@@ -226,7 +226,12 @@ fn shrink_image(document: &Document, id: ObjectId, drawn: Option<f64>) -> Option
     let stream = document.get_object(id).ok()?.as_stream().ok()?;
     let node = &stream.dict;
     let is_image = node.get(b"Subtype").and_then(Object::as_name).ok() == Some(&b"Image"[..]);
-    if !is_image || node.has(b"SMask") || node.has(b"Mask") || node.has(b"ImageMask") {
+    if !is_image
+        || node.has(b"SMask")
+        || node.has(b"Mask")
+        || node.has(b"ImageMask")
+        || node.has(b"Decode")
+    {
         return None;
     }
     let width = node.get(b"Width").ok()?.as_i64().ok()? as u32;
@@ -239,6 +244,10 @@ fn shrink_image(document: &Document, id: ObjectId, drawn: Option<f64>) -> Option
     });
     let picture = match filter.as_deref() {
         Some(b"DCTDecode") => {
+            let space = document.dereference(node.get(b"ColorSpace").ok()?).ok()?.1;
+            if !matches!(space.as_name().ok()?, b"DeviceRGB" | b"DeviceGray") {
+                return None;
+            }
             let picture = ImageReader::with_format(Cursor::new(&stream.content), ImageFormat::Jpeg);
             picture.decode().ok()?.to_rgb8()
         }
@@ -317,6 +326,13 @@ pub fn apply_redactions(
     let failed = || "The redaction could not be applied, so nothing was saved.".to_owned();
     let mut document = Document::load_mem(bytes).map_err(describe)?;
     let page_ids = document.get_pages();
+    crate::forms::remove_page_fields(
+        &mut document,
+        &targets
+            .iter()
+            .map(|target| target.number)
+            .collect::<Vec<_>>(),
+    )?;
     for target in targets {
         let page = pdfium
             .pages()
@@ -530,6 +546,84 @@ mod tests {
     fn compression_never_returns_something_larger() {
         let source = fixture();
         assert!(compress_pdf(&source).unwrap().len() <= source.len());
+    }
+
+    #[test]
+    fn compression_preserves_decode_mappings_and_unsupported_color_spaces() {
+        let source = images_to_pdf(&[jpeg(400, 400)], PageFit::Original).unwrap();
+        let base = Document::load_mem(&source).unwrap();
+        let id = base
+            .objects
+            .iter()
+            .find_map(|(id, object)| {
+                object
+                    .as_stream()
+                    .ok()
+                    .filter(|stream| {
+                        stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image")
+                    })
+                    .map(|_| *id)
+            })
+            .unwrap();
+        assert!(shrink_image(&base, id, Some(36.0)).is_some());
+        let mut document = base.clone();
+        document
+            .get_object_mut(id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .dict
+            .set(
+                "Decode",
+                vec![1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()],
+            );
+        assert!(shrink_image(&document, id, Some(36.0)).is_none());
+        for space in [
+            Object::Name(b"DeviceCMYK".to_vec()),
+            Object::Array(vec![Object::Name(b"ICCBased".to_vec()), Object::Null]),
+        ] {
+            let mut document = base.clone();
+            document
+                .get_object_mut(id)
+                .unwrap()
+                .as_stream_mut()
+                .unwrap()
+                .dict
+                .set("ColorSpace", space);
+            assert!(shrink_image(&document, id, Some(36.0)).is_none());
+        }
+    }
+
+    #[test]
+    fn redaction_removes_form_values_and_appearances() {
+        let source = crate::forms::tests::form_fixture();
+        let engine = engine();
+        let bytes = source.clone();
+        let redacted = engine
+            .with_temporary(source, None, move |document| {
+                apply_redactions(
+                    document,
+                    &bytes,
+                    &[RedactionPage {
+                        number: 1,
+                        rects: vec![Rect {
+                            x: 30.0,
+                            y: 300.0,
+                            width: 200.0,
+                            height: 24.0,
+                        }],
+                    }],
+                )
+            })
+            .unwrap();
+        let document = Document::load_mem(&redacted).unwrap();
+        assert!(!document.catalog().unwrap().has(b"AcroForm"));
+        assert!(
+            !document
+                .objects
+                .values()
+                .any(|object| object.as_dict().ok().is_some_and(|node| node.has(b"V")))
+        );
     }
 
     #[test]

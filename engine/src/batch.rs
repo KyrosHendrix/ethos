@@ -170,7 +170,14 @@ pub fn compare_documents(
 ) -> Result<Vec<Change>, String> {
     let before = all_lines(engine, other, progress)?;
     let after = all_lines(engine, current, progress)?;
-    Ok(compare_lines(&before, &after))
+    if !progress(0, 1) {
+        return Err(CANCELLED.into());
+    }
+    let changes = compare_lines(&before, &after)?;
+    if !progress(1, 1) {
+        return Err(CANCELLED.into());
+    }
+    Ok(changes)
 }
 
 #[cfg(test)]

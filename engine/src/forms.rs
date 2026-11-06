@@ -1,8 +1,8 @@
 //! Interactive form fields: reading them for the reader, and writing filled values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use ethos_core::{FieldKind, FieldValue, FormField, Rect, encode_win_ansi};
+use ethos_core::{ChoiceOption, FieldKind, FieldValue, FormField, Rect, encode_win_ansi};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::pages::describe;
@@ -116,7 +116,7 @@ fn name_value(document: &Document, node: &Dictionary) -> Option<String> {
     }
 }
 
-fn choices(document: &Document, node: &Dictionary) -> Vec<String> {
+fn choices(document: &Document, node: &Dictionary) -> Vec<ChoiceOption> {
     let Some(Object::Array(options)) = inherited(document, node, b"Opt") else {
         return Vec::new();
     };
@@ -125,11 +125,17 @@ fn choices(document: &Document, node: &Dictionary) -> Vec<String> {
         .filter_map(|option| {
             let option = document.dereference(option).ok()?.1;
             let mut holder = Dictionary::new();
-            match option {
-                Object::Array(pair) => holder.set("V", pair.last()?.clone()),
-                other => holder.set("V", other.clone()),
-            }
-            text_of(&holder, b"V")
+            let (value, label) = match option {
+                Object::Array(pair) => (pair.first()?, pair.get(1)?),
+                other => (other, other),
+            };
+            holder.set("V", value.clone());
+            let value = text_of(&holder, b"V")?;
+            holder.set("V", label.clone());
+            Some(ChoiceOption {
+                value,
+                label: text_of(&holder, b"V")?,
+            })
         })
         .collect()
 }
@@ -172,12 +178,16 @@ fn widget_field(document: &Document, widget: &Dictionary, page: u32) -> Option<F
 
 /// Every fillable widget in the document, by page.
 pub fn read_fields(bytes: &[u8]) -> Vec<FormField> {
-    if !bytes.windows(8).any(|part| part == b"AcroForm") {
-        return Vec::new();
-    }
     let Ok(document) = Document::load_mem(bytes) else {
         return Vec::new();
     };
+    if document
+        .catalog()
+        .and_then(|catalog| catalog.get(b"AcroForm"))
+        .is_err()
+    {
+        return Vec::new();
+    }
     if document.is_encrypted() || document.encryption_state.is_some() {
         return Vec::new();
     }
@@ -236,6 +246,126 @@ fn value_holder(document: &Document, widget: ObjectId) -> ObjectId {
         Some(parent) if without_name => parent,
         _ => widget,
     }
+}
+
+/// Unlinks fields from pages rebuilt by redaction, including shared widgets and empty groups.
+pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Result<(), String> {
+    let mut removed = HashSet::new();
+    for (number, id) in document.get_pages() {
+        if !pages.contains(&number) {
+            continue;
+        }
+        if let Ok(node) = document.get_dictionary(id)
+            && let Ok((_, Object::Array(annotations))) = node
+                .get(b"Annots")
+                .and_then(|value| document.dereference(value))
+        {
+            for item in annotations {
+                if let Ok(id) = item.as_reference()
+                    && document.get_dictionary(id).is_ok_and(|widget| {
+                        widget.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Widget")
+                    })
+                {
+                    removed.insert(id);
+                    removed.insert(value_holder(document, id));
+                }
+            }
+        }
+    }
+    loop {
+        let before = removed.len();
+        for (&id, object) in &document.objects {
+            let Ok(node) = object.as_dict() else { continue };
+            let parent_removed = node
+                .get(b"Parent")
+                .and_then(Object::as_reference)
+                .is_ok_and(|parent| removed.contains(&parent));
+            let empty_group = node
+                .get(b"Kids")
+                .and_then(|kids| document.dereference(kids))
+                .and_then(|(_, kids)| kids.as_array())
+                .is_ok_and(|kids| {
+                    !kids.is_empty()
+                        && kids
+                            .iter()
+                            .all(|kid| kid.as_reference().is_ok_and(|id| removed.contains(&id)))
+                });
+            // Page tree nodes also have Kids and Parent; only form nodes may be removed.
+            let page_node = matches!(
+                node.get(b"Type").and_then(Object::as_name).ok(),
+                Some(b"Page" | b"Pages")
+            );
+            if (parent_removed || empty_group) && !page_node {
+                removed.insert(id);
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+    let mut updates = Vec::new();
+    for (&id, object) in &document.objects {
+        if let Ok(node) = object.as_dict() {
+            for key in [b"Annots".as_slice(), b"Kids", b"Fields"] {
+                if let Ok((_, Object::Array(items))) =
+                    node.get(key).and_then(|value| document.dereference(value))
+                {
+                    let mut items = items.clone();
+                    items.retain(|item| !item.as_reference().is_ok_and(|id| removed.contains(&id)));
+                    updates.push((id, key, items));
+                }
+            }
+        }
+    }
+    for (id, key, items) in updates {
+        document
+            .get_object_mut(id)
+            .and_then(Object::as_dict_mut)
+            .map_err(describe)?
+            .set(key, items);
+    }
+    let form = document
+        .catalog()
+        .and_then(|catalog| catalog.get(b"AcroForm"))
+        .ok()
+        .cloned();
+    if let Some(form) = form {
+        let mut form = document
+            .dereference(&form)
+            .map_err(describe)?
+            .1
+            .as_dict()
+            .map_err(describe)?
+            .clone();
+        // AcroForm and its Fields array may be direct or indirect objects.
+        let fields = form
+            .get(b"Fields")
+            .ok()
+            .and_then(|fields| document.dereference(fields).ok())
+            .and_then(|(_, fields)| fields.as_array().ok())
+            .cloned()
+            .unwrap_or_default();
+        let fields: Vec<_> = fields
+            .into_iter()
+            .filter(|field| !field.as_reference().is_ok_and(|id| removed.contains(&id)))
+            .collect();
+        if fields.is_empty() {
+            document
+                .catalog_mut()
+                .map_err(describe)?
+                .remove(b"AcroForm");
+        } else {
+            form.set("Fields", fields);
+            document
+                .catalog_mut()
+                .map_err(describe)?
+                .set("AcroForm", form);
+        }
+    }
+    for id in removed {
+        document.objects.remove(&id);
+    }
+    Ok(())
 }
 
 fn text_object(text: &str) -> Object {
@@ -331,7 +461,13 @@ pub fn apply_fields(document: &mut Document, values: &[FieldValue]) -> Result<()
             FieldKind::Text { multiline } => {
                 text_appearance(document, field.rect, value, *multiline)
             }
-            FieldKind::Choice { .. } => text_appearance(document, field.rect, value, false),
+            FieldKind::Choice { options } => {
+                let label = options
+                    .iter()
+                    .find(|option| option.value == value)
+                    .map_or(value, |option| option.label.as_str());
+                text_appearance(document, field.rect, label, false)
+            }
             _ => None,
         };
         let node = document
@@ -444,7 +580,12 @@ pub(crate) mod tests {
         assert_eq!(
             fields[2].kind,
             FieldKind::Choice {
-                options: vec!["Small".into(), "Large".into()]
+                options: ["Small", "Large"]
+                    .map(|text| ChoiceOption {
+                        value: text.into(),
+                        label: text.into()
+                    })
+                    .to_vec()
             }
         );
         assert_eq!(fields[0].page, 1);
@@ -453,6 +594,151 @@ pub(crate) mod tests {
     #[test]
     fn documents_without_forms_have_no_fields() {
         assert!(read_fields(&crate::export::tests::fixture()).is_empty());
+    }
+
+    #[test]
+    fn fields_in_compressed_object_streams_remain_fillable() {
+        let mut document = Document::load_mem(&form_fixture()).unwrap();
+        let mut compressed = Vec::new();
+        document.save_modern(&mut compressed).unwrap();
+        assert_eq!(read_fields(&compressed), read_fields(&form_fixture()));
+    }
+
+    #[test]
+    fn choice_labels_and_export_values_round_trip_separately() {
+        let mut document = Document::load_mem(&form_fixture()).unwrap();
+        let choice = all_widgets(&document)
+            .into_iter()
+            .find(|id| {
+                text_of(document.get_dictionary(*id).unwrap(), b"T").as_deref() == Some("size")
+            })
+            .unwrap();
+        document
+            .get_object_mut(choice)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "Opt",
+                vec![Object::Array(vec![
+                    Object::string_literal("L"),
+                    Object::string_literal("Large"),
+                ])],
+            );
+        let values = [FieldValue {
+            name: "size".into(),
+            value: "L".into(),
+        }];
+        apply_fields(&mut document, &values).unwrap();
+        let bytes = serialize(&mut document).unwrap();
+        let field = read_fields(&bytes)
+            .into_iter()
+            .find(|field| field.name == "size")
+            .unwrap();
+        assert_eq!(field.value, "L");
+        assert_eq!(
+            field.kind,
+            FieldKind::Choice {
+                options: vec![ChoiceOption {
+                    value: "L".into(),
+                    label: "Large".into()
+                }]
+            }
+        );
+        let appearance = document
+            .get_dictionary(choice)
+            .unwrap()
+            .get(b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"N")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let stream = document
+            .get_object(appearance)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        let content = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
+        assert!(
+            String::from_utf8(content)
+                .unwrap()
+                .contains("<4c61726765> Tj")
+        );
+    }
+
+    #[test]
+    fn redaction_unlinks_shared_widgets_and_preserves_unrelated_fields() {
+        let mut document = fixture_document();
+        let pages = document.get_pages();
+        let group = document.new_object_id();
+        let sensitive = document.new_object_id();
+        let appearance = document.add_object(Stream::new(
+            Dictionary::new(),
+            b"secret appearance".to_vec(),
+        ));
+        let mut widgets = Vec::new();
+        for page in [pages[&1], pages[&2]] {
+            widgets.push(document.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "Parent" => sensitive, "P" => page,
+                "Rect" => vec![30.into(), 300.into(), 230.into(), 324.into()],
+                "AP" => dictionary! { "N" => appearance },
+            }));
+        }
+        let retained = document.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "Parent" => group,
+            "T" => Object::string_literal("retained"), "V" => Object::string_literal("Public"), "P" => pages[&2],
+            "Rect" => vec![30.into(), 260.into(), 230.into(), 284.into()],
+        });
+        let kids = document.add_object(Object::Array(
+            widgets.iter().map(|id| Object::Reference(*id)).collect(),
+        ));
+        document.objects.insert(sensitive, dictionary! {
+            "T" => Object::string_literal("sensitive"), "FT" => "Tx", "Parent" => group,
+            "V" => Object::string_literal("Secret"), "DV" => Object::string_literal("Secret"), "Kids" => kids,
+        }.into());
+        document.objects.insert(group, dictionary! { "T" => Object::string_literal("group"), "Kids" => vec![sensitive.into(), retained.into()] }.into());
+        document
+            .get_object_mut(pages[&1])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", vec![widgets[0].into()]);
+        let annots = document.add_object(Object::Array(vec![widgets[1].into(), retained.into()]));
+        document
+            .get_object_mut(pages[&2])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", annots);
+        let fields = document.add_object(Object::Array(vec![group.into()]));
+        document
+            .catalog_mut()
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => fields });
+        remove_page_fields(&mut document, &[1]).unwrap();
+        document.prune_objects();
+        let bytes = serialize(&mut document).unwrap();
+        let fields = read_fields(&bytes);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            (
+                fields[0].name.as_str(),
+                fields[0].value.as_str(),
+                fields[0].page
+            ),
+            ("group.retained", "Public", 2)
+        );
+        let saved = Document::load_mem(&bytes).unwrap();
+        assert!(!saved.objects.contains_key(&sensitive));
+        assert!(!saved.objects.contains_key(&appearance));
+        for widget in widgets {
+            assert!(!saved.objects.contains_key(&widget));
+        }
     }
 
     #[test]

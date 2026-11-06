@@ -97,19 +97,45 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// Checks every frame survives the ICO round trip with its corners cut.
-fn verify(path: &Path, frames: &[RgbaImage]) {
+fn verify(path: &Path) {
     let bytes = fs::read(path).expect("reading the written icon");
-    let count = u16::from_le_bytes([bytes[4], bytes[5]]);
-    assert_eq!(usize::from(count), SIZES.len(), "{}", path.display());
-    for frame in frames {
-        let size = frame.width();
-        assert_eq!(frame.get_pixel(0, 0)[3], 0, "corners must be transparent");
-        assert_eq!(
-            frame.get_pixel(size / 2, size / 2)[3],
-            255,
-            "the center must be opaque"
-        );
+    verify_bytes(&bytes).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}
+
+fn verify_bytes(bytes: &[u8]) -> Result<(), String> {
+    let invalid = || "Invalid or truncated ICO data.".to_owned();
+    let header = bytes.get(..6).ok_or_else(invalid)?;
+    if header[..4] != [0, 0, 1, 0]
+        || usize::from(u16::from_le_bytes([header[4], header[5]])) != SIZES.len()
+    {
+        return Err(invalid());
     }
+    let table_end = 6 + 16 * SIZES.len();
+    let entries = bytes.get(6..table_end).ok_or_else(invalid)?;
+    for (entry, size) in entries.as_chunks::<16>().0.iter().zip(SIZES) {
+        let length = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        let end = offset.checked_add(length).ok_or_else(invalid)?;
+        let dimension = if entry[0] == 0 {
+            256
+        } else {
+            u32::from(entry[0])
+        };
+        if offset < table_end || dimension != size || entry[0] != entry[1] {
+            return Err(invalid());
+        }
+        let payload = bytes.get(offset..end).ok_or_else(invalid)?;
+        let frame = image::load_from_memory_with_format(payload, image::ImageFormat::Png)
+            .map_err(|error| error.to_string())?
+            .to_rgba8();
+        if frame.dimensions() != (size, size)
+            || frame.get_pixel(0, 0)[3] != 0
+            || frame.get_pixel(size / 2, size / 2)[3] != 255
+        {
+            return Err("Icon dimensions or transparency did not survive encoding.".into());
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -131,7 +157,7 @@ fn main() {
         fs::write(directory.join(format!("{stem}.png")), &large).expect("writing the PNG");
         let path = directory.join(format!("{stem}.ico"));
         fs::write(&path, &icon).expect("writing the icon");
-        verify(&path, &frames);
+        verify(&path);
     }
 
     // Embed the approved raster so SVG consumers use the exact same mark.
@@ -164,5 +190,26 @@ mod tests {
         assert!(inside_tile(50.0, 50.0, 50.0));
         assert!(inside_tile(50.0, 1.0, 50.0));
         assert!(!inside_tile(2.0, 2.0, 50.0));
+    }
+
+    #[test]
+    fn encoded_frames_are_decoded_and_checked() {
+        let mut artwork = RgbaImage::from_pixel(256, 256, image::Rgba([30, 60, 90, 255]));
+        mask_tile(&mut artwork);
+        let frames = SIZES.map(|size| scaled(&artwork, size));
+        let bytes = ico(&frames);
+        verify_bytes(&bytes).unwrap();
+        assert!(verify_bytes(&bytes[..5]).is_err());
+        assert!(verify_bytes(&bytes[..bytes.len() - 20]).is_err());
+        let mut corrupt = bytes.clone();
+        let offset = u32::from_le_bytes(corrupt[18..22].try_into().unwrap()) as usize;
+        corrupt[offset] = 0;
+        assert!(verify_bytes(&corrupt).is_err());
+        let mut wrong_dimensions = bytes;
+        wrong_dimensions[6] = 24;
+        assert!(verify_bytes(&wrong_dimensions).is_err());
+        let opaque =
+            SIZES.map(|size| RgbaImage::from_pixel(size, size, image::Rgba([30, 60, 90, 255])));
+        assert!(verify_bytes(&ico(&opaque)).is_err());
     }
 }

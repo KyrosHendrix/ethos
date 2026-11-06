@@ -362,13 +362,6 @@ fn annotate(
 /// Takes ethos marks back out of a saved copy so they are editable instead of painted in.
 /// Returns the file without them, or `None` when it holds none, along with the marks.
 pub fn split_marks(bytes: &[u8]) -> (Option<Vec<u8>>, Vec<Mark>) {
-    // Parsing is slow for large files, and only copies ethos wrote contain the key.
-    if !bytes
-        .windows(MARK_KEY.len())
-        .any(|part| part == MARK_KEY.as_bytes())
-    {
-        return (None, Vec::new());
-    }
     let Ok(mut document) = Document::load_mem(bytes) else {
         return (None, Vec::new());
     };
@@ -402,6 +395,9 @@ pub fn split_marks(bytes: &[u8]) -> (Option<Vec<u8>>, Vec<Mark>) {
         if set_page_annotations(&mut document, page, kept).is_err() {
             return (None, Vec::new());
         }
+    }
+    if marks.is_empty() {
+        return (None, marks);
     }
     document.prune_objects();
     let mut clean = Vec::new();
@@ -987,6 +983,19 @@ pub(crate) mod tests {
         let result = export_pdf(&fixture(), &chosen).unwrap();
         assert_eq!(annotation_kinds(&result), ["Ink"]);
         assert_eq!(split_marks(&result).1, [signature]);
+    }
+
+    #[test]
+    fn compressed_marks_reopen_as_editable_annotations() {
+        let marks = every_mark();
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let exported = export_pdf(&fixture(), &edits(pages, marks.clone())).unwrap();
+        let mut document = Document::load_mem(&exported).unwrap();
+        let mut bytes = Vec::new();
+        document.save_modern(&mut bytes).unwrap();
+        let (stripped, restored) = split_marks(&bytes);
+        assert!(stripped.is_some());
+        assert_eq!(restored, marks);
     }
 
     fn every_mark() -> Vec<Mark> {

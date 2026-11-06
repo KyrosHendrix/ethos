@@ -344,7 +344,7 @@ fn FieldInput(field: FormField, #[prop(into)] viewport: Signal<Viewport>) -> imp
                     <option value=""></option>
                     {options
                         .into_iter()
-                        .map(|option| view! { <option value=option.clone()>{option.clone()}</option> })
+                        .map(|option| view! { <option value=option.value>{option.label}</option> })
                         .collect_view()}
                 </select>
             }

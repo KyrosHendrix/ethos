@@ -2,6 +2,7 @@
 //! Every tool writes a new file. An open document and its source are never changed.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -87,13 +88,38 @@ fn current_bytes(shell: &Shell, edits: Option<&Edits>) -> Answer<Vec<u8>> {
         .clone()
         .ok_or("No document is open.")?;
     match edits {
-        Some(edits) => export_pdf(&source, edits),
+        Some(edits) => redacted_copy(shell, export_pdf(&source, edits)?, edits),
         None => Ok(source.to_vec()),
     }
 }
 
 fn sources(shell: &Shell) -> Vec<PathBuf> {
     shell.state().sources.clone()
+}
+
+fn write_extras(folder: &Path, outputs: &[OutputFile]) -> Answer<()> {
+    for output in outputs {
+        if folder.join(&output.name).exists() {
+            return Err(format!(
+                "{} already exists. Choose a different export name or folder.",
+                output.name
+            ));
+        }
+    }
+    for output in outputs {
+        let target = folder.join(&output.name);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&output.bytes)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn describe_size(bytes: usize) -> String {
@@ -240,16 +266,9 @@ pub async fn run(
             .await
             .map_err(|error| error.to_string())?;
             let produced: Vec<OutputFile> = produced?;
-            let mut outputs = produced.into_iter();
-            let main = outputs.next().ok_or("Nothing was produced.")?;
+            let (main, outputs) = produced.split_first().ok_or("Nothing was produced.")?;
             if let Some(folder) = folder {
-                for extra in outputs {
-                    let target = folder.join(&extra.name);
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                    }
-                    fs::write(target, extra.bytes).map_err(|error| error.to_string())?;
-                }
+                write_extras(&folder, outputs)?;
             }
             let label = format!(
                 "Saved {}.",
@@ -594,4 +613,75 @@ pub fn redacted_copy(shell: &Shell, exported: Vec<u8>, edits: &Edits) -> Answer<
         verify_redactions(document, &checked)
     })?;
     Ok(verified)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethos_core::{InkColor, Mark, MarkKind, PageEntry, Rect};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn markdown_images_keep_their_links_and_never_replace_existing_files() {
+        let folder = std::env::temp_dir().join(format!("ethos-markdown-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&folder).unwrap();
+        let output = OutputFile {
+            name: "Report images/picture-1.png".into(),
+            bytes: b"new".to_vec(),
+        };
+        write_extras(&folder, std::slice::from_ref(&output)).unwrap();
+        let target = folder.join(&output.name);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        fs::write(&target, b"original").unwrap();
+        assert!(write_extras(&folder, &[output]).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn tool_inputs_apply_redactions_before_extraction_or_splitting() {
+        let source = ethos_engine::create_sample().unwrap();
+        let shell = Shell {
+            engine: ethos_engine::Engine::start(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pdfium/pdfium.dll"),
+            ),
+            tokens: AtomicU64::new(0),
+            tool_running: AtomicBool::new(false),
+            tool_cancelled: AtomicBool::new(false),
+            state: Mutex::new(crate::State {
+                current: Some(Arc::new(source.clone())),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(current_bytes(&shell, None).unwrap(), source);
+        let edits = Edits {
+            pages: vec![PageEntry {
+                source: 1,
+                rotation: None,
+            }],
+            marks: vec![Mark {
+                id: "redacted".into(),
+                page: 1,
+                color: InkColor::Blue,
+                kind: MarkKind::Redaction {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 612.0,
+                        height: 792.0,
+                    },
+                },
+            }],
+            ..Default::default()
+        };
+        let bytes = current_bytes(&shell, Some(&edits)).unwrap();
+        let extracted = extract_pages(&bytes, &[1]).unwrap();
+        shell
+            .engine
+            .with_temporary(extracted, None, |document| {
+                verify_redactions(document, &[1])
+            })
+            .unwrap();
+    }
 }

@@ -2,6 +2,9 @@
 
 use ethos_core::{Change, ChangeKind, Rect, TextRun};
 use similar::{DiffOp, TextDiff};
+use std::time::{Duration, Instant};
+
+const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn normalized(run: &TextRun) -> String {
     run.text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -11,12 +14,28 @@ fn normalized(run: &TextRun) -> String {
 ///
 /// Lines are the unit because that is how people scan a change list, and it stays fast on
 /// long documents. Lines that merely moved between pages count as unchanged.
-pub fn compare_lines(other: &[(u32, TextRun)], current: &[(u32, TextRun)]) -> Vec<Change> {
+pub fn compare_lines(
+    other: &[(u32, TextRun)],
+    current: &[(u32, TextRun)],
+) -> Result<Vec<Change>, String> {
+    compare_until(other, current, Instant::now() + DIFF_TIMEOUT)
+}
+
+fn compare_until(
+    other: &[(u32, TextRun)],
+    current: &[(u32, TextRun)],
+    deadline: Instant,
+) -> Result<Vec<Change>, String> {
     let before: Vec<String> = other.iter().map(|(_, run)| normalized(run)).collect();
     let after: Vec<String> = current.iter().map(|(_, run)| normalized(run)).collect();
     let old: Vec<&str> = before.iter().map(String::as_str).collect();
     let new: Vec<&str> = after.iter().map(String::as_str).collect();
-    let diff = TextDiff::from_slices(&old, &new);
+    let diff = TextDiff::configure()
+        .deadline(deadline)
+        .diff_slices(&old, &new);
+    if Instant::now() >= deadline {
+        return Err("Comparing these documents took too long. Try comparing fewer pages.".into());
+    }
     let join = |lines: &[&str]| lines.join(" ");
     let rects = |range: std::ops::Range<usize>| -> Vec<Rect> {
         current[range].iter().map(|(_, run)| run.rect).collect()
@@ -65,7 +84,7 @@ pub fn compare_lines(other: &[(u32, TextRun)], current: &[(u32, TextRun)]) -> Ve
             }),
         }
     }
-    changes
+    Ok(changes)
 }
 
 #[cfg(test)]
@@ -91,14 +110,18 @@ mod tests {
 
     #[test]
     fn identical_versions_have_no_changes() {
-        assert!(compare_lines(&lines(1, &["a", "b"]), &lines(1, &["a", "b"])).is_empty());
+        assert!(
+            compare_lines(&lines(1, &["a", "b"]), &lines(1, &["a", "b"]))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn edits_additions_and_removals_are_told_apart() {
         let old = lines(1, &["Same", "The fee is 10", "Dropped clause", "End"]);
         let new = lines(2, &["Same", "The fee is 12", "End", "New clause"]);
-        let changes = compare_lines(&old, &new);
+        let changes = compare_lines(&old, &new).unwrap();
         let kinds: Vec<_> = changes.iter().map(|change| change.kind).collect();
         assert_eq!(kinds, [ChangeKind::Changed, ChangeKind::Added]);
         assert_eq!(changes[0].before, "The fee is 10 Dropped clause");
@@ -109,7 +132,7 @@ mod tests {
 
     #[test]
     fn removed_text_points_at_the_nearest_remaining_page() {
-        let changes = compare_lines(&lines(1, &["Keep", "Remove"]), &lines(3, &["Keep"]));
+        let changes = compare_lines(&lines(1, &["Keep", "Remove"]), &lines(3, &["Keep"])).unwrap();
         assert_eq!(changes[0].kind, ChangeKind::Removed);
         assert_eq!(changes[0].page, 3);
         assert!(changes[0].rects.is_empty());
@@ -117,6 +140,17 @@ mod tests {
 
     #[test]
     fn spacing_differences_are_not_changes() {
-        assert!(compare_lines(&lines(1, &["two  spaces"]), &lines(1, &["two spaces"])).is_empty());
+        assert!(
+            compare_lines(&lines(1, &["two  spaces"]), &lines(1, &["two spaces"]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expired_comparisons_report_an_error_instead_of_approximate_changes() {
+        let error =
+            compare_until(&lines(1, &["Old"]), &lines(1, &["New"]), Instant::now()).unwrap_err();
+        assert!(error.contains("took too long"));
     }
 }
