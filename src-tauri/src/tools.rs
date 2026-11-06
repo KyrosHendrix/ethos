@@ -757,8 +757,18 @@ mod tests {
             }),
         };
         assert_eq!(current_bytes(&shell, None, |_, _| true).unwrap(), source);
-        let control =
-            extract_pages(&current_bytes(&shell, None, |_, _| true).unwrap(), &[1]).unwrap();
+        let clean_edits = Edits {
+            pages: vec![PageEntry {
+                source: 1,
+                rotation: None,
+            }],
+            ..Default::default()
+        };
+        let control = extract_pages(
+            &current_bytes(&shell, Some(&clean_edits), |_, _| true).unwrap(),
+            &[1],
+        )
+        .unwrap();
         let text = shell
             .engine
             .with_temporary(control, None, |document| {
@@ -773,10 +783,6 @@ mod tests {
             .unwrap();
         assert!(text.contains("The best tools"));
         let edits = Edits {
-            pages: vec![PageEntry {
-                source: 1,
-                rotation: None,
-            }],
             marks: vec![Mark {
                 id: "redacted".into(),
                 page: 1,
@@ -790,7 +796,7 @@ mod tests {
                     },
                 },
             }],
-            ..Default::default()
+            ..clean_edits
         };
         assert_eq!(
             current_bytes(&shell, Some(&edits), |_, _| false).unwrap_err(),
