@@ -369,7 +369,7 @@ async fn save_copy(app: AppHandle, edits: Edits, name: String) -> Answer<SaveOut
     let worker = app.clone();
     let bytes = spawn_blocking(move || {
         let exported = export_pdf(&source, &edits)?;
-        tools::redacted_copy(&worker.state::<Shell>(), exported, &edits)
+        tools::redacted_copy(&worker.state::<Shell>(), exported, &edits, |_, _| true)
     })
     .await
     .map_err(|error| error.to_string())??;

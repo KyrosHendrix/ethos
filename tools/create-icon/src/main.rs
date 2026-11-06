@@ -102,6 +102,7 @@ fn verify(path: &Path) {
     verify_bytes(&bytes).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
 
+/// Decodes every ICO payload and checks its dimensions and transparency.
 fn verify_bytes(bytes: &[u8]) -> Result<(), String> {
     let invalid = || "Invalid or truncated ICO data.".to_owned();
     let header = bytes.get(..6).ok_or_else(invalid)?;
@@ -138,6 +139,7 @@ fn verify_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes matching app icons from the approved artwork and verifies the encoded ICOs.
 fn main() {
     let mut artwork = image::open(SOURCE)
         .expect("reading the logo source")

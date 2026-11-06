@@ -21,6 +21,7 @@ pub fn compare_lines(
     compare_until(other, current, Instant::now() + DIFF_TIMEOUT)
 }
 
+/// Uses a deadline and refuses approximate results once the comparison times out.
 fn compare_until(
     other: &[(u32, TextRun)],
     current: &[(u32, TextRun)],

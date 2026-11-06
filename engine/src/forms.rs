@@ -116,6 +116,7 @@ fn name_value(document: &Document, node: &Dictionary) -> Option<String> {
     }
 }
 
+/// Decodes choice labels and export values, including indirect option strings.
 fn choices(document: &Document, node: &Dictionary) -> Vec<ChoiceOption> {
     let Some(Object::Array(options)) = inherited(document, node, b"Opt") else {
         return Vec::new();
@@ -129,9 +130,9 @@ fn choices(document: &Document, node: &Dictionary) -> Vec<ChoiceOption> {
                 Object::Array(pair) => (pair.first()?, pair.get(1)?),
                 other => (other, other),
             };
-            holder.set("V", value.clone());
+            holder.set("V", document.dereference(value).ok()?.1.clone());
             let value = text_of(&holder, b"V")?;
-            holder.set("V", label.clone());
+            holder.set("V", document.dereference(label).ok()?.1.clone());
             Some(ChoiceOption {
                 value,
                 label: text_of(&holder, b"V")?,
@@ -250,7 +251,19 @@ fn value_holder(document: &Document, widget: ObjectId) -> ObjectId {
 
 /// Unlinks fields from pages rebuilt by redaction, including shared widgets and empty groups.
 pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Result<(), String> {
+    if pages.is_empty() {
+        return Ok(());
+    }
+    if let Ok(form) = document
+        .catalog()
+        .and_then(|catalog| catalog.get(b"AcroForm"))
+        && let Ok((_, Object::Dictionary(form))) = document.dereference(form)
+        && form.has(b"XFA")
+    {
+        return Err("Redaction is not supported for XFA forms. Nothing was saved.".into());
+    }
     let mut removed = HashSet::new();
+    let mut inherited_values = HashSet::new();
     for (number, id) in document.get_pages() {
         if !pages.contains(&number) {
             continue;
@@ -268,9 +281,38 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
                 {
                     removed.insert(id);
                     removed.insert(value_holder(document, id));
+                    let widget = document.get_dictionary(id).map_err(describe)?;
+                    for key in [b"V".as_slice(), b"DV"] {
+                        if widget.has(key) {
+                            continue;
+                        }
+                        let mut parent = widget.get(b"Parent").and_then(Object::as_reference).ok();
+                        for _ in 0..MAX_DEPTH {
+                            let Some(id) = parent else { break };
+                            let node = document.get_dictionary(id).map_err(describe)?;
+                            if node.has(key) {
+                                inherited_values.insert((id, key));
+                            }
+                            parent = node.get(b"Parent").and_then(Object::as_reference).ok();
+                        }
+                        if parent.is_some() {
+                            return Err("The form field hierarchy could not be safely redacted. Nothing was saved.".into());
+                        }
+                    }
                 }
             }
         }
+    }
+    if removed.is_empty() {
+        return Ok(());
+    }
+    for (id, key) in inherited_values {
+        let node = document
+            .get_object_mut(id)
+            .and_then(Object::as_dict_mut)
+            .map_err(describe)?;
+        node.remove(key);
+        node.remove(b"AP");
     }
     loop {
         let before = removed.len();
@@ -306,7 +348,7 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
     let mut updates = Vec::new();
     for (&id, object) in &document.objects {
         if let Ok(node) = object.as_dict() {
-            for key in [b"Annots".as_slice(), b"Kids", b"Fields"] {
+            for key in [b"Annots".as_slice(), b"Kids"] {
                 if let Ok((_, Object::Array(items))) =
                     node.get(key).and_then(|value| document.dereference(value))
                 {
@@ -343,23 +385,27 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
             .ok()
             .and_then(|fields| document.dereference(fields).ok())
             .and_then(|(_, fields)| fields.as_array().ok())
-            .cloned()
-            .unwrap_or_default();
-        let fields: Vec<_> = fields
-            .into_iter()
-            .filter(|field| !field.as_reference().is_ok_and(|id| removed.contains(&id)))
-            .collect();
-        if fields.is_empty() {
-            document
-                .catalog_mut()
-                .map_err(describe)?
-                .remove(b"AcroForm");
-        } else {
-            form.set("Fields", fields);
-            document
-                .catalog_mut()
-                .map_err(describe)?
-                .set("AcroForm", form);
+            .cloned();
+        if let Some(fields) = fields {
+            let count = fields.len();
+            let fields: Vec<_> = fields
+                .into_iter()
+                .filter(|field| !field.as_reference().is_ok_and(|id| removed.contains(&id)))
+                .collect();
+            if fields.len() < count {
+                if fields.is_empty() {
+                    document
+                        .catalog_mut()
+                        .map_err(describe)?
+                        .remove(b"AcroForm");
+                } else {
+                    form.set("Fields", fields);
+                    document
+                        .catalog_mut()
+                        .map_err(describe)?
+                        .set("AcroForm", form);
+                }
+            }
         }
     }
     for id in removed {
@@ -613,6 +659,8 @@ pub(crate) mod tests {
                 text_of(document.get_dictionary(*id).unwrap(), b"T").as_deref() == Some("size")
             })
             .unwrap();
+        let export_value = document.add_object(Object::string_literal("L"));
+        let display_label = document.add_object(Object::string_literal("Large"));
         document
             .get_object_mut(choice)
             .unwrap()
@@ -621,8 +669,8 @@ pub(crate) mod tests {
             .set(
                 "Opt",
                 vec![Object::Array(vec![
-                    Object::string_literal("L"),
-                    Object::string_literal("Large"),
+                    export_value.into(),
+                    display_label.into(),
                 ])],
             );
         let values = [FieldValue {
@@ -738,6 +786,110 @@ pub(crate) mod tests {
         assert!(!saved.objects.contains_key(&appearance));
         for widget in widgets {
             assert!(!saved.objects.contains_key(&widget));
+        }
+    }
+
+    #[test]
+    fn redaction_clears_inherited_values_but_keeps_unrelated_fields() {
+        let mut document = fixture_document();
+        let pages = document.get_pages();
+        let group = document.new_object_id();
+        let rect = vec![30.into(), 300.into(), 230.into(), 324.into()];
+        let sensitive = document.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "Parent" => group, "P" => pages[&1],
+            "T" => Object::string_literal("sensitive"), "Rect" => Object::Array(rect.clone()),
+        });
+        let retained = document.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "Parent" => group, "P" => pages[&2],
+            "T" => Object::string_literal("retained"), "V" => Object::string_literal("Public"), "Rect" => rect,
+        });
+        document.objects.insert(group, dictionary! {
+            "FT" => "Tx", "V" => Object::string_literal("Secret"), "DV" => Object::string_literal("Default secret"),
+            "Kids" => vec![sensitive.into(), retained.into()],
+        }.into());
+        document
+            .get_object_mut(pages[&1])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", vec![sensitive.into()]);
+        document
+            .get_object_mut(pages[&2])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", vec![retained.into()]);
+        document
+            .catalog_mut()
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![group.into()] });
+        remove_page_fields(&mut document, &[1]).unwrap();
+        document.prune_objects();
+        let bytes = serialize(&mut document).unwrap();
+        let saved = Document::load_mem(&bytes).unwrap();
+        let ancestor = saved.get_dictionary(group).unwrap();
+        assert!(!ancestor.has(b"V") && !ancestor.has(b"DV"));
+        let fields = read_fields(&bytes);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            (fields[0].name.as_str(), fields[0].value.as_str()),
+            ("retained", "Public")
+        );
+    }
+
+    #[test]
+    fn redaction_rejects_xfa_data_and_leaves_the_source_unchanged() {
+        let mut document = Document::load_mem(&form_fixture()).unwrap();
+        let xfa = document.add_object(Stream::new(
+            Dictionary::new(),
+            b"<data><name>Secret</name></data>".to_vec(),
+        ));
+        let form = document
+            .catalog()
+            .unwrap()
+            .get(b"AcroForm")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        document
+            .get_object_mut(form)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("XFA", xfa);
+        let original = document.objects.clone();
+        assert!(
+            remove_page_fields(&mut document, &[1])
+                .unwrap_err()
+                .contains("XFA")
+        );
+        assert_eq!(document.objects, original);
+    }
+
+    #[test]
+    fn redaction_preserves_form_metadata_when_no_fields_are_removed() {
+        for fields in [None, Some(Object::Null), Some(Object::Array(Vec::new()))] {
+            let mut document = fixture_document();
+            let mut form = dictionary! { "NeedAppearances" => true };
+            if let Some(fields) = fields {
+                form.set("Fields", fields);
+            }
+            document
+                .catalog_mut()
+                .unwrap()
+                .set("AcroForm", form.clone());
+            remove_page_fields(&mut document, &[]).unwrap();
+            remove_page_fields(&mut document, &[1]).unwrap();
+            assert_eq!(
+                document
+                    .catalog()
+                    .unwrap()
+                    .get(b"AcroForm")
+                    .unwrap()
+                    .as_dict()
+                    .unwrap(),
+                &form
+            );
         }
     }
 

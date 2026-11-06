@@ -81,23 +81,65 @@ fn read_limited(path: &Path) -> Answer<Vec<u8>> {
 }
 
 /// What the open document looks like now, with its marks, page changes and form values.
-fn current_bytes(shell: &Shell, edits: Option<&Edits>) -> Answer<Vec<u8>> {
+fn current_bytes(
+    shell: &Shell,
+    edits: Option<&Edits>,
+    progress: impl Fn(u32, u32) -> bool + Send + Sync + 'static,
+) -> Answer<Vec<u8>> {
+    if !progress(0, 1) {
+        return Err(ethos_engine::CANCELLED.into());
+    }
     let source = shell
         .state()
         .current
         .clone()
         .ok_or("No document is open.")?;
     match edits {
-        Some(edits) => redacted_copy(shell, export_pdf(&source, edits)?, edits),
+        Some(edits) => redacted_copy(shell, export_pdf(&source, edits)?, edits, progress),
         None => Ok(source.to_vec()),
     }
+}
+
+/// Prepares tool input on the blocking pool, with redaction progress and cancellation.
+async fn prepare_current(app: &AppHandle, edits: Option<&Edits>) -> Answer<Vec<u8>> {
+    let app = app.clone();
+    let edits = edits.cloned();
+    spawn_blocking(move || {
+        current_bytes(
+            &app.state::<Shell>(),
+            edits.as_ref(),
+            reporter(&app, "Preparing the document"),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn sources(shell: &Shell) -> Vec<PathBuf> {
     shell.state().sources.clone()
 }
 
-fn write_extras(folder: &Path, outputs: &[OutputFile]) -> Answer<()> {
+/// Removes newly created auxiliary files unless the main export also succeeds.
+#[derive(Default)]
+struct AuxiliaryFiles(Vec<PathBuf>);
+
+impl AuxiliaryFiles {
+    fn keep(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for AuxiliaryFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Writes linked images without replacement and rolls them back on export failure.
+fn write_extras(folder: &Path, outputs: &[OutputFile]) -> Answer<AuxiliaryFiles> {
+    let mut created = AuxiliaryFiles::default();
     for output in outputs {
         if folder.join(&output.name).exists() {
             return Err(format!(
@@ -116,10 +158,11 @@ fn write_extras(folder: &Path, outputs: &[OutputFile]) -> Answer<()> {
             .create_new(true)
             .open(&target)
             .map_err(|error| error.to_string())?;
+        created.0.push(target);
         file.write_all(&output.bytes)
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(created)
 }
 
 fn describe_size(bytes: usize) -> String {
@@ -242,7 +285,7 @@ pub async fn run(
             let Some(path) = pick_destination(&app, suggested, &filter, title).await? else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let worker = app.clone();
             let kind = request.clone();
             let output_stem = stem_of(&path.to_string_lossy());
@@ -267,20 +310,23 @@ pub async fn run(
             .map_err(|error| error.to_string())?;
             let produced: Vec<OutputFile> = produced?;
             let (main, outputs) = produced.split_first().ok_or("Nothing was produced.")?;
-            if let Some(folder) = folder {
-                write_extras(&folder, outputs)?;
-            }
+            let auxiliary = match folder {
+                Some(folder) => write_extras(&folder, outputs)?,
+                None => AuxiliaryFiles::default(),
+            };
             let label = format!(
                 "Saved {}.",
                 path.file_name().unwrap_or_default().to_string_lossy()
             );
-            finish_file(&shell, path, &main.bytes, label, None)
+            let outcome = finish_file(&shell, path, &main.bytes, label, None)?;
+            auxiliary.keep();
+            Ok(outcome)
         }
         ToolRequest::Images { jpeg, dpi } => {
             let Some(folder) = pick_folder(&app, "Choose a folder for the pictures").await? else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let worker = app.clone();
             let pictures = spawn_blocking(move || {
                 let shell = worker.state::<Shell>();
@@ -319,7 +365,7 @@ pub async fn run(
             else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let output = extract_pages(&bytes, &pages)?;
             finish_file(
                 &shell,
@@ -330,7 +376,7 @@ pub async fn run(
             )
         }
         ToolRequest::Split { ranges, every } => {
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let worker = app.clone();
             let source = bytes.clone();
             let total =
@@ -383,7 +429,7 @@ pub async fn run(
             };
             let mut documents = Vec::new();
             if include_current {
-                documents.push(current_bytes(&shell, edits.as_ref())?);
+                documents.push(prepare_current(&app, edits.as_ref()).await?);
             }
             for source in &paths {
                 documents.push(read_limited(source)?);
@@ -474,7 +520,7 @@ pub async fn run(
             else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let worker = app.clone();
             let produced = spawn_blocking(move || {
                 searchable_copy(
@@ -507,7 +553,7 @@ pub async fn run(
             else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let before = bytes.len();
             let output = spawn_blocking(move || compress_pdf(&bytes))
                 .await
@@ -530,7 +576,7 @@ pub async fn run(
             else {
                 return Ok(ToolOutcome::Cancelled);
             };
-            let bytes = current_bytes(&shell, edits.as_ref())?;
+            let bytes = prepare_current(&app, edits.as_ref()).await?;
             let output = protect_pdf(&bytes, &password)?;
             finish_file(
                 &shell,
@@ -572,7 +618,7 @@ pub async fn run(
                 },
             };
             let other = read_limited(&chosen)?;
-            let current = current_bytes(&shell, None)?;
+            let current = prepare_current(&app, None).await?;
             let worker = app.clone();
             let changes = spawn_blocking(move || {
                 compare_documents(
@@ -596,21 +642,40 @@ pub async fn run(
 }
 
 /// A copy with redactions burned in, or an error if anything survived them.
-pub fn redacted_copy(shell: &Shell, exported: Vec<u8>, edits: &Edits) -> Answer<Vec<u8>> {
+pub fn redacted_copy(
+    shell: &Shell,
+    exported: Vec<u8>,
+    edits: &Edits,
+    progress: impl Fn(u32, u32) -> bool + Send + Sync + 'static,
+) -> Answer<Vec<u8>> {
     let targets = redaction_pages(edits);
     if targets.is_empty() {
         return Ok(exported);
     }
     let source = exported.clone();
+    let progress = std::sync::Arc::new(progress);
+    let report = progress.clone();
     let checked: Vec<u32> = targets.iter().map(|target| target.number).collect();
     let result = shell
         .engine
         .with_temporary(exported, None, move |document| {
-            apply_redactions(document, &source, &targets)
+            apply_redactions(document, &source, &targets, &|done, total| {
+                report(done, total * 2)
+            })
         })?;
     let verified = result.clone();
     shell.engine.with_temporary(result, None, move |document| {
-        verify_redactions(document, &checked)
+        let count = checked.len() as u32;
+        for (index, page) in checked.into_iter().enumerate() {
+            if !progress(count + index as u32, count * 2) {
+                return Err(ethos_engine::CANCELLED.into());
+            }
+            verify_redactions(document, &[page])?;
+        }
+        if !progress(count * 2, count * 2) {
+            return Err(ethos_engine::CANCELLED.into());
+        }
+        Ok(())
     })?;
     Ok(verified)
 }
@@ -630,12 +695,49 @@ mod tests {
             name: "Report images/picture-1.png".into(),
             bytes: b"new".to_vec(),
         };
-        write_extras(&folder, std::slice::from_ref(&output)).unwrap();
+        write_extras(&folder, std::slice::from_ref(&output))
+            .unwrap()
+            .keep();
         let target = folder.join(&output.name);
         assert_eq!(fs::read(&target).unwrap(), b"new");
         fs::write(&target, b"original").unwrap();
         assert!(write_extras(&folder, &[output]).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"original");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn failed_exports_roll_back_only_their_own_images() {
+        let folder = std::env::temp_dir().join(format!("ethos-rollback-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("blocked"), b"original").unwrap();
+        let first = OutputFile {
+            name: "images/first.png".into(),
+            bytes: b"new".to_vec(),
+        };
+        let blocked = OutputFile {
+            name: "blocked/second.png".into(),
+            bytes: b"new".to_vec(),
+        };
+        assert!(
+            write_extras(
+                &folder,
+                &[
+                    OutputFile {
+                        name: first.name.clone(),
+                        bytes: first.bytes.clone()
+                    },
+                    blocked
+                ]
+            )
+            .is_err()
+        );
+        assert!(!folder.join("images/first.png").exists());
+        assert_eq!(fs::read(folder.join("blocked")).unwrap(), b"original");
+        let auxiliary = write_extras(&folder, &[first]).unwrap();
+        assert!(folder.join("images/first.png").exists());
+        drop(auxiliary); // The main-file write did not succeed.
+        assert!(!folder.join("images/first.png").exists());
         fs::remove_dir_all(folder).unwrap();
     }
 
@@ -654,7 +756,22 @@ mod tests {
                 ..Default::default()
             }),
         };
-        assert_eq!(current_bytes(&shell, None).unwrap(), source);
+        assert_eq!(current_bytes(&shell, None, |_, _| true).unwrap(), source);
+        let control =
+            extract_pages(&current_bytes(&shell, None, |_, _| true).unwrap(), &[1]).unwrap();
+        let text = shell
+            .engine
+            .with_temporary(control, None, |document| {
+                Ok(document
+                    .pages()
+                    .get(0)
+                    .map_err(|e| e.to_string())?
+                    .text()
+                    .map_err(|e| e.to_string())?
+                    .all())
+            })
+            .unwrap();
+        assert!(text.contains("The best tools"));
         let edits = Edits {
             pages: vec![PageEntry {
                 source: 1,
@@ -675,7 +792,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        let bytes = current_bytes(&shell, Some(&edits)).unwrap();
+        assert_eq!(
+            current_bytes(&shell, Some(&edits), |_, _| false).unwrap_err(),
+            ethos_engine::CANCELLED
+        );
+        assert_eq!(
+            current_bytes(&shell, Some(&edits), |done, _| done == 0).unwrap_err(),
+            ethos_engine::CANCELLED
+        );
+        assert_eq!(
+            current_bytes(&shell, Some(&edits), |done, total| done < total).unwrap_err(),
+            ethos_engine::CANCELLED
+        );
+        let bytes = current_bytes(&shell, Some(&edits), |_, _| true).unwrap();
         let extracted = extract_pages(&bytes, &[1]).unwrap();
         shell
             .engine

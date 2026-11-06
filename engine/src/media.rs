@@ -322,6 +322,7 @@ pub fn apply_redactions(
     pdfium: &PdfDocument,
     bytes: &[u8],
     targets: &[RedactionPage],
+    progress: &impl Fn(u32, u32) -> bool,
 ) -> Result<Vec<u8>, String> {
     let failed = || "The redaction could not be applied, so nothing was saved.".to_owned();
     let mut document = Document::load_mem(bytes).map_err(describe)?;
@@ -333,7 +334,10 @@ pub fn apply_redactions(
             .map(|target| target.number)
             .collect::<Vec<_>>(),
     )?;
-    for target in targets {
+    for (index, target) in targets.iter().enumerate() {
+        if !progress(index as u32, targets.len() as u32) {
+            return Err(crate::CANCELLED.into());
+        }
         let page = pdfium
             .pages()
             .get((target.number - 1) as i32)
@@ -373,6 +377,9 @@ pub fn apply_redactions(
             }
         }
         let mut jpeg = Vec::new();
+        if !progress(index as u32, targets.len() as u32) {
+            return Err(crate::CANCELLED.into());
+        }
         JpegEncoder::new_with_quality(&mut jpeg, 88)
             .encode(pixels.as_raw(), width, height, ExtendedColorType::Rgb8)
             .map_err(|_| failed())?;
@@ -413,6 +420,9 @@ pub fn apply_redactions(
         ] {
             node.remove(key);
         }
+    }
+    if !progress(targets.len() as u32, targets.len() as u32) {
+        return Err(crate::CANCELLED.into());
     }
     // Outlines and named destinations can repeat a redacted heading.
     let root = document
@@ -613,6 +623,7 @@ mod tests {
                             height: 24.0,
                         }],
                     }],
+                    &|_, _| true,
                 )
             })
             .unwrap();
@@ -643,7 +654,7 @@ mod tests {
                             height: 25.0,
                         }],
                     }];
-                    apply_redactions(document, &bytes, &targets)
+                    apply_redactions(document, &bytes, &targets, &|_, _| true)
                 })
                 .unwrap()
         };

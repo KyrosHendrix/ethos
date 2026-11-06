@@ -304,6 +304,7 @@ impl Worker<'_> {
         })
     }
 
+    /// Rejects stale document tokens and invalid one-based page numbers.
     fn page(&self, token: u64, source: u32) -> Result<PdfPage<'_>, String> {
         let (current, document) = self
             .document
@@ -356,6 +357,7 @@ impl Worker<'_> {
             .join(" "))
     }
 
+    /// Searches only the current document, checking its token before any cache access.
     fn search(
         &mut self,
         token: u64,

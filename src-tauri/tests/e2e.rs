@@ -928,6 +928,7 @@ fn form_pdf() -> Vec<u8> {
         "Opt" => vec![
             Object::Array(vec![Object::string_literal("S"), Object::string_literal("Small")]),
             Object::Array(vec![Object::string_literal("L"), Object::string_literal("Large")]),
+            Object::Array(vec![Object::string_literal(""), Object::string_literal("No size")]),
         ],
     });
     document
@@ -1205,9 +1206,24 @@ fn tools_produce_real_files() {
     app.wait_text("Split into 2 PDFs.");
     dismiss_toast(&mut app);
     let part = fs::read(redacted_parts.join("Report - part 1.pdf")).unwrap();
+    let part_document = Document::load_mem(&part).unwrap();
+    assert_eq!(part_document.get_pages().len(), 2);
+    assert!(pdf_text(&part).contains("Select a passage"));
     assert!(
         !pdf_text(&part).contains("The best tools"),
         "split output bypassed redaction"
+    );
+    assert!(
+        part_document
+            .objects
+            .values()
+            .filter_map(|object| object.as_stream().ok())
+            .all(|stream| {
+                let content = stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                !content.windows(14).any(|part| part == b"The best tools")
+            })
     );
     // Back to a clean document for the remaining tools.
     for _ in 0..3 {
@@ -1370,13 +1386,26 @@ fn tools_produce_real_files() {
     app.press("Tab", 9, 0);
     app.eval("(document.activeElement.blur(), true)");
     app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
-    app.wait("document.querySelector('.form-field select')?.value === 'S'");
+    app.wait("document.querySelector('.form-field select')?.value === '0'");
     assert_eq!(
-        app.eval("document.querySelector('.form-field select option[value=L]').textContent")
+        app.eval("document.querySelector('.form-field select option[value=\"1\"]').textContent")
             .as_str(),
         Some("Large")
     );
-    app.eval("(() => { const select = document.querySelector('.form-field select'); select.value = 'L'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
+    app.eval("(() => { const select = document.querySelector('.form-field select'); select.value = '2'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
+    app.wait("document.querySelector('.form-field select')?.selectedOptions[0]?.textContent === 'No size'");
+    app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    app.wait("document.querySelector('.form-field select')?.selectedOptions[0]?.textContent === 'No size'");
+    app.script_dialog("save-dialog.txt", &out("Empty choice.pdf"));
+    app.control('s');
+    app.wait_text("Copy saved");
+    assert_eq!(
+        read_fields(&fs::read(out("Empty choice.pdf")).unwrap())[2].value,
+        ""
+    );
+    dismiss_toast(&mut app);
+    app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    app.eval("(() => { const select = document.querySelector('.form-field select'); select.value = '1'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
     sleep(Duration::from_millis(300));
     app.shot("form");
     app.script_dialog("save-dialog.txt", &out("Filled.pdf"));

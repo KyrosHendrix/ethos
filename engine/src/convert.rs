@@ -131,6 +131,7 @@ pub fn to_text(pages: &[Vec<Block>]) -> String {
     output
 }
 
+/// Removes forbidden XML 1.0 characters before escaping DOCX text content.
 fn escape_xml(text: &str) -> String {
     text.chars()
         .filter(|&c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..))

@@ -274,6 +274,7 @@ fn input_style(field: &FormField, viewport: Viewport) -> String {
 
 /// One form field drawn over the page. Each finished change is a single undo step.
 #[component]
+/// Renders a PDF field and maps choice identities to their exported values.
 fn FieldInput(field: FormField, #[prop(into)] viewport: Signal<Viewport>) -> impl IntoView {
     let store = expect_context::<Store>();
     let name = field.name.clone();
@@ -334,17 +335,31 @@ fn FieldInput(field: FormField, #[prop(into)] viewport: Signal<Viewport>) -> imp
             .into_any()
         }
         FieldKind::Choice { options } => {
-            let current = value.clone();
+            let choices = options.clone();
+            let current = move || {
+                let value = value();
+                choices
+                    .iter()
+                    .position(|option| option.value == value)
+                    .map(|index| index.to_string())
+                    .unwrap_or_default()
+            };
+            let chosen = options.clone();
             view! {
                 <select
                     aria-label=field.name.clone()
                     prop:value=current
-                    on:change=move |event| commit(event_target_value(&event))
+                    on:change=move |event| {
+                        let index = event_target_value(&event).parse::<usize>().ok();
+                        let value = index.and_then(|index| chosen.get(index)).map(|option| option.value.clone()).unwrap_or_default();
+                        commit(value);
+                    }
                 >
                     <option value=""></option>
                     {options
                         .into_iter()
-                        .map(|option| view! { <option value=option.value>{option.label}</option> })
+                        .enumerate()
+                        .map(|(index, option)| view! { <option value=index.to_string()>{option.label}</option> })
                         .collect_view()}
                 </select>
             }

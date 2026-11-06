@@ -173,11 +173,11 @@ pub fn compare_documents(
     if !progress(0, 1) {
         return Err(CANCELLED.into());
     }
-    let changes = compare_lines(&before, &after)?;
-    if !progress(1, 1) {
+    let changes = compare_lines(&before, &after);
+    if !progress(u32::from(changes.is_ok()), 1) {
         return Err(CANCELLED.into());
     }
-    Ok(changes)
+    changes
 }
 
 #[cfg(test)]
