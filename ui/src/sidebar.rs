@@ -7,8 +7,9 @@ use wasm_bindgen::JsValue;
 
 use crate::controls::{Icon, IconButton};
 use crate::icons;
-use crate::page::Thumbnail;
-use crate::store::{Store, Tab};
+use crate::page::{PageDrag, Thumbnail};
+use crate::store::{PaletteOrigin, Sheet, Store, Tab};
+use crate::tools::ChangesPanel;
 
 fn opened_date(opened_at: f64) -> String {
     let options = js_sys::Object::new();
@@ -85,6 +86,14 @@ pub fn LibraryView() -> impl IntoView {
                     <Icon data=icons::FOLDER_OPEN size=16 />
                     "Open document"
                     <kbd>"Ctrl O"</kbd>
+                </button>
+                <button
+                    class="nav-item"
+                    on:click=move |_| store.palette.set(Some(PaletteOrigin::Keyboard))
+                >
+                    <Icon data=icons::WRENCH size=16 />
+                    "Tools"
+                    <kbd>"Ctrl K"</kbd>
                 </button>
                 <div class="sidebar-recent-heading">"Recents"</div>
                 <div class="recent-nav">
@@ -194,6 +203,8 @@ fn mark_icon(mark: &Mark) -> &'static str {
         MarkKind::Highlight { .. } => icons::HIGHLIGHTER,
         MarkKind::Pen { .. } => icons::PEN_LINE,
         MarkKind::Text { .. } => icons::TYPE,
+        MarkKind::Signature { .. } => icons::SIGNATURE,
+        MarkKind::Redaction { .. } => icons::RECTANGLE_HORIZONTAL,
     }
 }
 
@@ -201,6 +212,8 @@ fn mark_summary(mark: &Mark) -> String {
     match &mark.kind {
         MarkKind::Highlight { text, .. } | MarkKind::Text { text, .. } => text.clone(),
         MarkKind::Pen { .. } => "Handwritten mark".into(),
+        MarkKind::Signature { .. } => "Signature".into(),
+        MarkKind::Redaction { .. } => "Area to remove".into(),
     }
 }
 
@@ -211,6 +224,15 @@ fn NotesPanel(#[prop(into)] marks: Signal<Vec<Mark>>) -> impl IntoView {
         <div class="notes-list">
             <div class="section-caption">
                 "Annotations " <span>{move || marks.read().len()}</span>
+                <Show when=move || !marks.read().is_empty()>
+                    <button
+                        type="button"
+                        class="text-button"
+                        on:click=move |_| store.sheet.set(Some(Sheet::Notes))
+                    >
+                        "Export"
+                    </button>
+                </Show>
             </div>
             {move || {
                 let items = marks.get();
@@ -404,9 +426,16 @@ pub fn DocumentSidebar(#[prop(into)] visible_marks: Signal<Vec<Mark>>) -> impl I
     let pages = Memo::new(move |_| store.edits().pages.clone());
     let note_count = Signal::derive(move || visible_marks.read().len());
     let token = Signal::derive(move || store.doc.read().as_ref().map_or(0, |doc| doc.token));
+    let drag = RwSignal::new(None::<PageDrag>);
+    let settling = RwSignal::new(None::<(u32, f64)>);
+    let selected_count = move || store.selection.read().len();
     let panel_class = move || {
         if tab.get() == Tab::Pages {
-            "sidebar-content thumbnail-grid"
+            if drag.read().is_some() {
+                "sidebar-content thumbnail-grid reordering"
+            } else {
+                "sidebar-content thumbnail-grid"
+            }
         } else {
             "sidebar-content"
         }
@@ -459,7 +488,12 @@ pub fn DocumentSidebar(#[prop(into)] visible_marks: Signal<Vec<Mark>>) -> impl I
                         <For
                             each=move || {
                                 let token = token.get();
-                                pages.get().into_iter().map(move |entry| (token, entry.source))
+                                let count = store.doc.read().as_ref().map_or(0, |doc| doc.pages.len() as u32);
+                                pages
+                                    .get()
+                                    .into_iter()
+                                    .map(move |entry| (token, entry.source))
+                                    .filter(move |(_, source)| *source <= count)
                             }
                             key=|key| *key
                             children=move |(token, source)| {
@@ -493,7 +527,11 @@ pub fn DocumentSidebar(#[prop(into)] visible_marks: Signal<Vec<Mark>>) -> impl I
                                         active=Signal::derive(move || {
                                             store.page.get() == index.get() + 1
                                         })
-                                        on_click=move || store.navigate(index.get_untracked() + 1)
+                                        selected=Signal::derive(move || {
+                                            store.selection.read().contains(&source)
+                                        })
+                                        drag=drag
+                                        settling=settling
                                     />
                                 }
                             }
@@ -505,11 +543,41 @@ pub fn DocumentSidebar(#[prop(into)] visible_marks: Signal<Vec<Mark>>) -> impl I
                     <Show when=move || tab.get() == Tab::Search>
                         <SearchPanel />
                     </Show>
+                    <Show when=move || tab.get() == Tab::Changes>
+                        <ChangesPanel />
+                    </Show>
                 </div>
-                <div class="document-sidebar-footer">
-                    <span>{move || pages.read().len()} " pages"</span>
-                    <span>{footer_size}</span>
-                </div>
+                <Show
+                    when=move || selected_count() != 0
+                    fallback=move || {
+                        view! {
+                            <div class="document-sidebar-footer">
+                                <span>{move || plural(pages.read().len(), "page", "pages")}</span>
+                                <span>{footer_size}</span>
+                            </div>
+                        }
+                    }
+                >
+                    <div class="selection-bar" role="toolbar" aria-label="Selected pages">
+                        <span>{move || format!("{} selected", selected_count())}</span>
+                        <IconButton
+                            label="Save as a new PDF"
+                            on_click=move || {
+                                let pages = store.selected_numbers();
+                                store.selection.update(std::collections::BTreeSet::clear);
+                                store.run_tool(ethos_core::ToolRequest::Extract { pages });
+                            }
+                        >
+                            <Icon data=icons::FILE_OUTPUT size=15 />
+                        </IconButton>
+                        <IconButton label="Rotate" on_click=move || store.rotate_selection()>
+                            <Icon data=icons::ROTATE_CW size=15 />
+                        </IconButton>
+                        <IconButton label="Delete" on_click=move || store.delete_selection()>
+                            <Icon data=icons::TRASH size=14 />
+                        </IconButton>
+                    </div>
+                </Show>
             </aside>
         </div>
     }

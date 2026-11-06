@@ -5,6 +5,7 @@ members = ["core", "engine", "src-tauri", "tools/create-icon", "ui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 ethos-core = { path = "core" }

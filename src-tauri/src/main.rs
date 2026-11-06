@@ -1,34 +1,47 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dialogs;
 #[cfg(windows)]
 mod drop;
 mod files;
+mod tools;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ethos_core::{
     Edits, LoadOutcome, RecentFile, SAMPLE_NAME, SaveOutcome, SearchHit, StagedFile, TextRun,
+    ToolOutcome, ToolRequest,
 };
-use ethos_engine::{Engine, Frame, create_sample, export_pdf};
+use ethos_engine::{Engine, Frame, create_sample, export_pdf, read_fields, split_marks};
 use files::Recent;
 use tauri::async_runtime::{Sender, channel, spawn, spawn_blocking};
 use tauri::ipc::Response;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow, WindowEvent};
 
-type Answer<T> = Result<T, String>;
+pub(crate) type Answer<T> = Result<T, String>;
+
+/// A file read from disk, waiting for the interface to parse it.
+struct Staged {
+    token: u64,
+    bytes: Arc<Vec<u8>>,
+    /// Content hash for files on disk. The sample has none and keeps nothing.
+    key: Option<String>,
+}
 
 /// Everything shared between commands, window events and the second-instance callback.
-struct Shell {
-    engine: Engine,
+pub(crate) struct Shell {
+    pub(crate) engine: Engine,
     tokens: AtomicU64,
+    pub(crate) tool_running: AtomicBool,
+    pub(crate) tool_cancelled: AtomicBool,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     dirty: bool,
     interface_ready: bool,
     file_operation: bool,
@@ -36,20 +49,30 @@ struct State {
     discard_request: Option<(String, Sender<bool>)>,
     recent: Vec<Recent>,
     /// Every source stays protected, even if the interface rejects a newly read PDF.
-    sources: Vec<PathBuf>,
-    staged: Option<(u64, Arc<Vec<u8>>)>,
-    current: Option<Arc<Vec<u8>>>,
+    pub(crate) sources: Vec<PathBuf>,
+    staged: Option<Staged>,
+    pub(crate) current: Option<Arc<Vec<u8>>>,
+    /// The password that opened the current document, kept only while it is open.
+    pub(crate) password: Option<String>,
+    /// Files tools wrote, the only paths the interface may ask to open.
+    pub(crate) outputs: Vec<PathBuf>,
+    /// Which saved session the open document writes to, if it keeps one.
+    session: Option<(u64, String)>,
 }
 
 impl Shell {
-    fn state(&self) -> MutexGuard<'_, State> {
+    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("shell state poisoned")
     }
 
-    fn stage(&self, name: String, bytes: Vec<u8>) -> StagedFile {
+    fn stage(&self, name: String, bytes: Vec<u8>, key: Option<String>) -> StagedFile {
         let token = self.tokens.fetch_add(1, Ordering::Relaxed) + 1;
         let size = bytes.len() as u64;
-        self.state().staged = Some((token, Arc::new(bytes)));
+        self.state().staged = Some(Staged {
+            token,
+            bytes: Arc::new(bytes),
+            key,
+        });
         StagedFile { token, name, size }
     }
 }
@@ -116,73 +139,14 @@ fn read_and_stage(app: &AppHandle, path: PathBuf) -> Answer<StagedFile> {
     };
     // A recent list that cannot be written must not stop the document opening.
     let _ = files::write_recents(&data_dir(app), &recents);
-    Ok(shell.stage(opened.name, opened.bytes))
+    Ok(shell.stage(opened.name, opened.bytes, Some(opened.key)))
 }
 
-fn data_dir(app: &AppHandle) -> PathBuf {
+pub(crate) fn data_dir(app: &AppHandle) -> PathBuf {
     std::env::var_os("ETHOS_USER_DATA")
         .map(PathBuf::from)
         .or_else(|| app.path().data_dir().ok().map(|path| path.join("ethos")))
         .unwrap_or_else(std::env::temp_dir)
-}
-
-#[cfg(not(feature = "e2e"))]
-async fn pick_pdf(app: &AppHandle) -> Answer<Option<PathBuf>> {
-    use tauri_plugin_dialog::DialogExt;
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_title("Open a PDF")
-        .add_filter("PDF documents", &["pdf"]);
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    let picked = spawn_blocking(move || dialog.blocking_pick_file())
-        .await
-        .map_err(|error| error.to_string())?;
-    picked
-        .map(|path| path.into_path().map_err(|error| error.to_string()))
-        .transpose()
-}
-
-#[cfg(not(feature = "e2e"))]
-async fn pick_destination(app: &AppHandle, suggested: String) -> Answer<Option<PathBuf>> {
-    use tauri_plugin_dialog::DialogExt;
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_title("Save a copy")
-        .set_file_name(suggested)
-        .add_filter("PDF documents", &["pdf"]);
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    let picked = spawn_blocking(move || dialog.blocking_save_file())
-        .await
-        .map_err(|error| error.to_string())?;
-    picked
-        .map(|path| path.into_path().map_err(|error| error.to_string()))
-        .transpose()
-}
-
-/// Reads the scripted answer the end-to-end test wrote; an empty file cancels the dialog.
-#[cfg(feature = "e2e")]
-fn scripted_dialog(app: &AppHandle, file: &str) -> Answer<Option<PathBuf>> {
-    let answer = std::fs::read_to_string(data_dir(app).join(file))
-        .map_err(|_| format!("Native dialog called without a script: {file}"))?;
-    Ok((!answer.is_empty()).then(|| PathBuf::from(answer)))
-}
-
-#[cfg(feature = "e2e")]
-async fn pick_pdf(app: &AppHandle) -> Answer<Option<PathBuf>> {
-    scripted_dialog(app, "open-dialog.txt")
-}
-
-#[cfg(feature = "e2e")]
-async fn pick_destination(app: &AppHandle, suggested: String) -> Answer<Option<PathBuf>> {
-    std::fs::write(data_dir(app).join("save-suggestion.txt"), suggested)
-        .map_err(|error| error.to_string())?;
-    scripted_dialog(app, "save-dialog.txt")
 }
 
 #[tauri::command]
@@ -192,7 +156,7 @@ async fn open_file(app: AppHandle) -> Answer<Option<StagedFile>> {
     if !confirm_discard(&app).await {
         return Ok(None);
     }
-    let Some(path) = pick_pdf(&app).await? else {
+    let Some(path) = dialogs::pick_pdf(&app).await? else {
         return Ok(None);
     };
     read_and_stage(&app, path).map(Some)
@@ -230,7 +194,9 @@ async fn open_sample(app: AppHandle) -> Answer<StagedFile> {
     let bytes = spawn_blocking(create_sample)
         .await
         .map_err(|error| error.to_string())??;
-    Ok(app.state::<Shell>().stage(SAMPLE_NAME.to_owned(), bytes))
+    Ok(app
+        .state::<Shell>()
+        .stage(SAMPLE_NAME.to_owned(), bytes, None))
 }
 
 #[tauri::command]
@@ -245,26 +211,56 @@ async fn load_document(
     password: Option<String>,
 ) -> Answer<LoadOutcome> {
     let shell = app.state::<Shell>();
-    let bytes = match &shell.state().staged {
-        Some((staged, bytes)) if *staged == token => Arc::clone(bytes),
+    let (bytes, key) = match &shell.state().staged {
+        Some(staged) if staged.token == token => (Arc::clone(&staged.bytes), staged.key.clone()),
         _ => return Err("This file is no longer waiting to open.".into()),
     };
+    // Saved edits hold document text, so a protected file's are never written to disk.
+    let key = key.filter(|_| password.is_none());
+    let unlocked_with = password.clone();
     let worker = app.clone();
-    let source = Arc::clone(&bytes);
-    let outcome = spawn_blocking(move || {
-        worker
-            .state::<Shell>()
-            .engine
-            .load(token, source.to_vec(), password)
+    let (mut outcome, bytes, carried) = spawn_blocking(move || {
+        let (clean, carried) = split_marks(&bytes);
+        let bytes = clean.map_or(bytes, Arc::new);
+        let shell = worker.state::<Shell>();
+        let outcome = shell.engine.load(token, bytes.to_vec(), password);
+        outcome.map(|outcome| (outcome, bytes, carried))
     })
     .await
     .map_err(|error| error.to_string())??;
-    if matches!(outcome, LoadOutcome::Ready { .. }) {
+    if let LoadOutcome::Ready {
+        pages,
+        marks,
+        restored,
+        fields,
+        protected,
+    } = &mut outcome
+    {
+        *marks = carried;
+        *fields = read_fields(&bytes);
+        *protected = unlocked_with.is_some();
+        *restored = key
+            .as_ref()
+            .and_then(|key| files::read_session(&data_dir(&app), key, pages.len()));
         let mut state = shell.state();
         state.current = Some(bytes);
+        state.password = unlocked_with;
         state.staged = None;
+        state.session = key.map(|key| (token, key));
     }
     Ok(outcome)
+}
+
+/// Records the open document's edits. Returns false when it does not keep a session.
+#[tauri::command]
+fn save_session(app: AppHandle, token: u64, edits: Edits) -> Answer<bool> {
+    let session = app.state::<Shell>().state().session.clone();
+    match session {
+        Some((current, key)) if current == token => {
+            files::write_session(&data_dir(&app), &key, &edits).map(|()| true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[tauri::command]
@@ -274,7 +270,12 @@ fn cancel_load(shell: tauri::State<'_, Shell>) {
 
 #[tauri::command]
 fn close_document(shell: tauri::State<'_, Shell>) {
-    shell.state().current = None;
+    {
+        let mut state = shell.state();
+        state.current = None;
+        state.password = None;
+        state.session = None;
+    }
     shell.engine.close();
 }
 
@@ -365,15 +366,83 @@ async fn save_copy(app: AppHandle, edits: Edits, name: String) -> Answer<SaveOut
         .current
         .clone()
         .ok_or("No document is open.")?;
-    let bytes = spawn_blocking(move || export_pdf(&source, &edits))
-        .await
-        .map_err(|error| error.to_string())??;
-    let Some(destination) = pick_destination(&app, files::suggested_copy_name(&name)).await? else {
+    let worker = app.clone();
+    let bytes = spawn_blocking(move || {
+        let exported = export_pdf(&source, &edits)?;
+        tools::redacted_copy(&worker.state::<Shell>(), exported, &edits)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let suggested = files::suggested_copy_name(&name);
+    let filter = dialogs::Filter {
+        name: "PDF documents",
+        extensions: &["pdf"],
+    };
+    let Some(destination) =
+        dialogs::pick_destination(&app, suggested, &filter, "Save a copy").await?
+    else {
         return Ok(SaveOutcome::Cancelled);
     };
     let sources = shell.state().sources.clone();
     files::write_copy(&destination, &bytes, &sources)?;
     Ok(SaveOutcome::Saved)
+}
+
+#[tauri::command]
+async fn run_tool(
+    app: AppHandle,
+    request: ToolRequest,
+    edits: Option<Edits>,
+    name: String,
+) -> Answer<ToolOutcome> {
+    match tools::run(app, request, edits, name).await {
+        Err(error) if error == ethos_engine::CANCELLED => Ok(ToolOutcome::Cancelled),
+        outcome => outcome,
+    }
+}
+
+#[tauri::command]
+async fn pick_paths(app: AppHandle, kind: String) -> Answer<Vec<PathBuf>> {
+    let filter = if kind == "pictures" {
+        tools::PICTURES
+    } else {
+        tools::PDFS
+    };
+    dialogs::pick_files(&app, &filter, "Choose files").await
+}
+
+#[tauri::command]
+fn cancel_tool(shell: tauri::State<'_, Shell>) {
+    shell.tool_cancelled.store(true, Ordering::SeqCst);
+}
+
+/// Shows a tool's result. Only paths a tool wrote are accepted.
+#[tauri::command]
+fn reveal_output(shell: tauri::State<'_, Shell>, path: PathBuf, open: bool) -> Answer<()> {
+    if !shell.state().outputs.contains(&path) {
+        return Err("This file is no longer available.".into());
+    }
+    let mut command = std::process::Command::new("explorer");
+    if open || path.is_dir() {
+        command.arg(&path);
+    } else {
+        command.arg("/select,").arg(&path);
+    }
+    // Explorer reports a failure exit code even when it succeeds.
+    command.spawn().map(drop).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn open_output(app: AppHandle, path: PathBuf) -> Answer<Option<StagedFile>> {
+    let shell = app.state::<Shell>();
+    if !shell.state().outputs.contains(&path) {
+        return Err("This file is no longer available.".into());
+    }
+    let _operation = FileOperation::begin(&shell)?;
+    if !confirm_discard(&app).await {
+        return Ok(None);
+    }
+    read_and_stage(&app, path).map(Some)
 }
 
 #[tauri::command]
@@ -492,7 +561,7 @@ fn main() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _| {
         second_instance(app, args);
     }));
-    builder
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let library = app.path().resource_dir()?.join("pdfium.dll");
@@ -500,6 +569,8 @@ fn main() {
             app.manage(Shell {
                 engine: Engine::start(library),
                 tokens: AtomicU64::new(0),
+                tool_running: AtomicBool::new(false),
+                tool_cancelled: AtomicBool::new(false),
                 state: Mutex::new(State {
                     recent,
                     ..State::default()
@@ -524,23 +595,34 @@ fn main() {
             app_ready,
             cancel_load,
             cancel_render,
+            cancel_tool,
             close_document,
             confirm_leave,
             load_document,
             open_dropped,
             open_file,
+            open_output,
             open_recent,
             open_sample,
             page_text,
+            pick_paths,
             recent_files,
             render_page,
+            reveal_output,
+            run_tool,
             save_copy,
+            save_session,
             saved_theme,
             search_pages,
             set_dirty,
             set_title,
             window_action,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("ethos failed to start");
+    #[cfg(windows)]
+    app.handle()
+        .plugin(drop::init(app.handle()))
+        .expect("file drops failed to initialize");
+    app.run(|_, _| {});
 }

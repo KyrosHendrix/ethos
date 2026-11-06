@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ethos_core::{Edits, Mark, MarkKind, NOTE_FONT_SIZE, NOTE_LINE_HEIGHT, encode_win_ansi};
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
+use ethos_core::{
+    Edits, Mark, MarkKind, NOTE_FONT_SIZE, NOTE_LINE_HEIGHT, encode_win_ansi, note_width,
+};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
 const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 const HIGHLIGHT_STATE: &str = "EthosHighlight";
@@ -11,6 +13,9 @@ const NOTE_FONT: &str = "EthosFont";
 const HIGHLIGHT_OPACITY: f64 = 0.32;
 const PEN_OPACITY: f64 = 0.95;
 const PEN_WIDTH: f64 = 1.8;
+const MARK_KEY: &str = "EthosMark";
+const SIGNATURE_WIDTH: f64 = 1.4;
+const SIGNATURE_INK: &str = "#1b2a4a";
 
 fn describe(error: lopdf::Error) -> String {
     error.to_string()
@@ -28,14 +33,6 @@ fn inherited(document: &Document, page: ObjectId, key: &[u8]) -> Option<Object> 
         node = document.get_dictionary(parent).ok()?;
     }
     None
-}
-
-fn resolved_dictionary(document: &Document, value: &Object) -> Result<Dictionary, String> {
-    document
-        .dereference(value)
-        .and_then(|(_, object)| object.as_dict())
-        .cloned()
-        .map_err(describe)
 }
 
 fn page_rotation(document: &Document, page: ObjectId) -> Result<i64, String> {
@@ -88,7 +85,7 @@ fn color(hex: &str) -> [f64; 3] {
     })
 }
 
-/// The content-stream operators that draw `mark` in PDF page coordinates.
+/// The operators that draw `mark` in PDF page coordinates, used as its appearance.
 fn draw(mark: &Mark, output: &mut String) -> Result<(), String> {
     let ink = |values: [f64; 3]| format!("{:.4} {:.4} {:.4}", values[0], values[1], values[2]);
     match &mark.kind {
@@ -110,7 +107,7 @@ fn draw(mark: &Mark, output: &mut String) -> Result<(), String> {
             let stroke = ink(color(mark.color.stroke()));
             write!(
                 output,
-                "q /{PEN_STATE} gs {stroke} RG {PEN_WIDTH} w {:.3} {:.3} m",
+                "q /{PEN_STATE} gs {stroke} RG {PEN_WIDTH} w 1 J 1 j {:.3} {:.3} m",
                 first.x, first.y
             )
             .expect("writing to a String");
@@ -119,10 +116,33 @@ fn draw(mark: &Mark, output: &mut String) -> Result<(), String> {
             }
             output.push_str(" S Q\n");
         }
+        MarkKind::Signature { strokes } => {
+            let stroke = ink(color(SIGNATURE_INK));
+            write!(output, "q {stroke} RG {SIGNATURE_WIDTH} w 1 J 1 j")
+                .expect("writing to a String");
+            for points in strokes {
+                let Some((first, rest)) = points.split_first() else {
+                    continue;
+                };
+                write!(output, " {:.3} {:.3} m", first.x, first.y).expect("writing to a String");
+                for point in rest {
+                    write!(output, " {:.3} {:.3} l", point.x, point.y)
+                        .expect("writing to a String");
+                }
+                output.push_str(" S");
+            }
+            output.push_str(" Q\n");
+        }
+        // Redactions are burned into pixels by a later step, never drawn as a mark.
+        MarkKind::Redaction { .. } => {}
         MarkKind::Text { point, text } => {
             let fill = ink(color(mark.color.stroke()));
-            write!(output, "q {fill} rg BT /{NOTE_FONT} {NOTE_FONT_SIZE} Tf {NOTE_LINE_HEIGHT} TL {:.3} {:.3} Td", point.x, point.y)
-                .expect("writing to a String");
+            write!(
+                output,
+                "q {fill} rg BT /{NOTE_FONT} {NOTE_FONT_SIZE} Tf {NOTE_LINE_HEIGHT} TL {:.3} {:.3} Td",
+                point.x, point.y
+            )
+            .expect("writing to a String");
             for (index, line) in text.split('\n').enumerate() {
                 let encoded = encode_win_ansi(line).ok_or(
                     "This note contains characters the export font cannot display. Use Western European text for now.",
@@ -137,12 +157,11 @@ fn draw(mark: &Mark, output: &mut String) -> Result<(), String> {
     Ok(())
 }
 
-/// Objects shared by every annotated page of one export.
+/// Objects shared by every annotation of one export.
 struct MarkResources {
     highlight: ObjectId,
     pen: ObjectId,
     font: ObjectId,
-    save_state: ObjectId,
 }
 
 impl MarkResources {
@@ -159,60 +178,237 @@ impl MarkResources {
                 "BaseFont" => "Helvetica",
                 "Encoding" => "WinAnsiEncoding",
             }),
-            save_state: document.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec())),
         }
     }
 }
 
-/// Appends marks to a page, isolating them from any state its content leaves behind.
+/// The smallest `[left, bottom, right, top]` box holding a mark's appearance.
+fn mark_box(mark: &Mark) -> [f64; 4] {
+    let around = |points: &mut dyn Iterator<Item = (f64, f64)>, pad: f64| {
+        let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for (x, y) in points {
+            bounds = [
+                bounds[0].min(x),
+                bounds[1].min(y),
+                bounds[2].max(x),
+                bounds[3].max(y),
+            ];
+        }
+        [
+            bounds[0] - pad,
+            bounds[1] - pad,
+            bounds[2] + pad,
+            bounds[3] + pad,
+        ]
+    };
+    match &mark.kind {
+        MarkKind::Highlight { rects, .. } => around(
+            &mut rects
+                .iter()
+                .flat_map(|r| [(r.x, r.y), (r.x + r.width, r.y + r.height)]),
+            0.0,
+        ),
+        MarkKind::Pen { points } => around(
+            &mut points.iter().map(|point| (point.x, point.y)),
+            PEN_WIDTH,
+        ),
+        MarkKind::Signature { strokes } => around(
+            &mut strokes.iter().flatten().map(|point| (point.x, point.y)),
+            SIGNATURE_WIDTH,
+        ),
+        MarkKind::Redaction { rect } => [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height],
+        MarkKind::Text { point, text } => {
+            let lines = text.split('\n').count() as f64;
+            let width = text.split('\n').map(note_width).fold(0.0, f64::max);
+            [
+                point.x - 1.0,
+                point.y - (lines - 1.0) * NOTE_LINE_HEIGHT - 4.0,
+                point.x + width + 1.0,
+                point.y + NOTE_FONT_SIZE,
+            ]
+        }
+    }
+}
+
+fn numbers(values: impl IntoIterator<Item = f64>) -> Vec<Object> {
+    values
+        .into_iter()
+        .map(|value| Object::Real(value as f32))
+        .collect()
+}
+
+/// PDF text strings outside ASCII are UTF-16 with a byte order mark.
+fn text_string(text: &str) -> Object {
+    let mut bytes = vec![0xfe, 0xff];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+    Object::String(bytes, StringFormat::Hexadecimal)
+}
+
+/// Builds a standard annotation with its appearance, so any PDF app shows and edits it.
+/// `EthosMark` keeps the exact mark, so ethos can restore it without guessing.
+fn annotation(
+    document: &mut Document,
+    mark: &Mark,
+    shared: &MarkResources,
+) -> Result<ObjectId, String> {
+    let mut appearance = String::new();
+    draw(mark, &mut appearance)?;
+    let bounds = mark_box(mark);
+    let form = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => numbers(bounds),
+            "Resources" => dictionary! {
+                "ExtGState" => dictionary! {
+                    HIGHLIGHT_STATE => shared.highlight,
+                    PEN_STATE => shared.pen,
+                },
+                "Font" => dictionary! { NOTE_FONT => shared.font },
+            },
+        },
+        appearance.into_bytes(),
+    );
+    let form = document.add_object(form);
+    let stored = serde_json::to_vec(mark).map_err(|error| error.to_string())?;
+    let hex = match mark.kind {
+        MarkKind::Highlight { .. } => mark.color.ink(),
+        _ => mark.color.stroke(),
+    };
+    let mut node = dictionary! {
+        "Type" => "Annot",
+        "Rect" => numbers(bounds),
+        "NM" => text_string(&mark.id),
+        "F" => 4,
+        "C" => numbers(color(hex)),
+        "AP" => dictionary! { "N" => form },
+        MARK_KEY => Object::String(stored, StringFormat::Hexadecimal),
+    };
+    match &mark.kind {
+        MarkKind::Highlight { rects, text } => {
+            let corners = rects.iter().flat_map(|r| {
+                let (right, top) = (r.x + r.width, r.y + r.height);
+                [r.x, top, right, top, r.x, r.y, right, r.y]
+            });
+            node.set("Subtype", "Highlight");
+            node.set("QuadPoints", numbers(corners));
+            node.set("Contents", text_string(text));
+        }
+        MarkKind::Pen { points } => {
+            let path = points.iter().flat_map(|point| [point.x, point.y]);
+            node.set("Subtype", "Ink");
+            node.set("InkList", vec![Object::Array(numbers(path))]);
+            node.set("BS", dictionary! { "W" => PEN_WIDTH as f32 });
+        }
+        MarkKind::Signature { strokes } => {
+            let paths = strokes.iter().map(|points| {
+                Object::Array(numbers(points.iter().flat_map(|point| [point.x, point.y])))
+            });
+            node.set("Subtype", "Ink");
+            node.set("InkList", paths.collect::<Vec<_>>());
+            node.set("BS", dictionary! { "W" => SIGNATURE_WIDTH as f32 });
+        }
+        MarkKind::Redaction { .. } => node.set("Subtype", "Square"),
+        MarkKind::Text { text, .. } => {
+            let [r, g, b] = color(mark.color.stroke());
+            let default = format!("/{NOTE_FONT} {NOTE_FONT_SIZE} Tf {r:.4} {g:.4} {b:.4} rg");
+            node.set("Subtype", "FreeText");
+            node.set("Contents", text_string(text));
+            node.set("DA", Object::string_literal(default));
+        }
+    }
+    Ok(document.add_object(node))
+}
+
+/// The annotation references a page holds directly or through an indirect array.
+fn page_annotations(document: &Document, page: ObjectId) -> Result<Vec<Object>, String> {
+    let node = document.get_dictionary(page).map_err(describe)?;
+    match node.get(b"Annots") {
+        Ok(value) => {
+            let (_, value) = document.dereference(value).map_err(describe)?;
+            value.as_array().cloned().map_err(describe)
+        }
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn set_page_annotations(
+    document: &mut Document,
+    page: ObjectId,
+    annotations: Vec<Object>,
+) -> Result<(), String> {
+    let node = document
+        .get_object_mut(page)
+        .and_then(Object::as_dict_mut)
+        .map_err(describe)?;
+    node.set("Annots", annotations);
+    Ok(())
+}
+
+/// Adds marks to a page as annotations, leaving its content streams untouched.
 fn annotate(
     document: &mut Document,
     page: ObjectId,
     marks: &[&Mark],
     shared: &MarkResources,
 ) -> Result<(), String> {
-    let mut content = String::from("Q\n");
+    let mut annotations = page_annotations(document, page)?;
     for mark in marks {
-        draw(mark, &mut content)?;
+        annotations.push(annotation(document, mark, shared)?.into());
     }
-    let drawing = document.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+    set_page_annotations(document, page, annotations)
+}
 
-    let mut resources = match inherited(document, page, b"Resources") {
-        Some(value) => resolved_dictionary(document, &value)?,
-        None => Dictionary::new(),
+/// Takes ethos marks back out of a saved copy so they are editable instead of painted in.
+/// Returns the file without them, or `None` when it holds none, along with the marks.
+pub fn split_marks(bytes: &[u8]) -> (Option<Vec<u8>>, Vec<Mark>) {
+    // Parsing is slow for large files, and only copies ethos wrote contain the key.
+    if !bytes
+        .windows(MARK_KEY.len())
+        .any(|part| part == MARK_KEY.as_bytes())
+    {
+        return (None, Vec::new());
+    }
+    let Ok(mut document) = Document::load_mem(bytes) else {
+        return (None, Vec::new());
     };
-    let section = |resources: &Dictionary, key: &[u8]| match resources.get(key) {
-        Ok(value) => resolved_dictionary(document, value),
-        Err(_) => Ok(Dictionary::new()),
-    };
-    let mut states = section(&resources, b"ExtGState")?;
-    let mut fonts = section(&resources, b"Font")?;
-    states.set(HIGHLIGHT_STATE, shared.highlight);
-    states.set(PEN_STATE, shared.pen);
-    fonts.set(NOTE_FONT, shared.font);
-    resources.set("ExtGState", states);
-    resources.set("Font", fonts);
-
-    let node = document.get_dictionary(page).map_err(describe)?;
-    let existing = match node.get(b"Contents") {
-        Ok(Object::Array(streams)) => streams.clone(),
-        Ok(stream) => match document.dereference(stream).map_err(describe)?.1 {
-            Object::Array(streams) => streams.clone(),
-            _ => vec![stream.clone()],
-        },
-        Err(_) => Vec::new(),
-    };
-    let mut contents: Vec<Object> = vec![shared.save_state.into()];
-    contents.extend(existing);
-    contents.push(drawing.into());
-
-    let node = document
-        .get_object_mut(page)
-        .and_then(Object::as_dict_mut)
-        .map_err(describe)?;
-    node.set("Resources", resources);
-    node.set("Contents", contents);
-    Ok(())
+    // Encrypted files cannot be rewritten without their password, so their marks stay as
+    // ordinary annotations.
+    if document.is_encrypted() || document.encryption_state.is_some() {
+        return (None, Vec::new());
+    }
+    let mut marks = Vec::new();
+    for (number, page) in document.get_pages() {
+        let Ok(annotations) = page_annotations(&document, page) else {
+            continue;
+        };
+        let mut kept = Vec::with_capacity(annotations.len());
+        for item in annotations {
+            let stored = document
+                .dereference(&item)
+                .ok()
+                .and_then(|(_, object)| object.as_dict().ok())
+                .and_then(|node| node.get(MARK_KEY.as_bytes()).ok())
+                .and_then(|value| value.as_str().ok())
+                .and_then(|text| serde_json::from_slice::<Mark>(text).ok());
+            match stored {
+                Some(mark) => marks.push(Mark {
+                    page: number,
+                    ..mark
+                }),
+                None => kept.push(item),
+            }
+        }
+        if set_page_annotations(&mut document, page, kept).is_err() {
+            return (None, Vec::new());
+        }
+    }
+    document.prune_objects();
+    let mut clean = Vec::new();
+    match document.save_to(&mut clean) {
+        Ok(_) => (Some(clean), marks),
+        Err(_) => (None, Vec::new()),
+    }
 }
 
 fn stamp_metadata(document: &mut Document) -> Result<(), String> {
@@ -233,6 +429,30 @@ fn stamp_metadata(document: &mut Document) -> Result<(), String> {
     }
     info.set("Creator", Object::string_literal("ethos"));
     Ok(())
+}
+
+/// What must be removed from a saved copy, by that copy's page numbers.
+pub fn redaction_pages(edits: &Edits) -> Vec<crate::RedactionPage> {
+    edits
+        .pages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let rects: Vec<_> = edits
+                .marks
+                .iter()
+                .filter(|mark| mark.page == entry.source)
+                .filter_map(|mark| match mark.kind {
+                    MarkKind::Redaction { rect } => Some(rect),
+                    _ => None,
+                })
+                .collect();
+            (!rects.is_empty()).then_some(crate::RedactionPage {
+                number: index as u32 + 1,
+                rects,
+            })
+        })
+        .collect()
 }
 
 /// Writes `edits` into a new copy of the PDF in `bytes`, which is left untouched.
@@ -275,7 +495,11 @@ pub fn export_pdf(bytes: &[u8], edits: &Edits) -> Result<Vec<u8>, String> {
     }
 
     let mut marks: HashMap<u32, Vec<&Mark>> = HashMap::new();
-    for mark in &edits.marks {
+    for mark in edits
+        .marks
+        .iter()
+        .filter(|mark| !matches!(mark.kind, MarkKind::Redaction { .. }))
+    {
         marks.entry(mark.page).or_default().push(mark);
     }
     let has_visible_marks = edits
@@ -298,6 +522,7 @@ pub fn export_pdf(bytes: &[u8], edits: &Edits) -> Result<Vec<u8>, String> {
             annotate(&mut document, page, marks, shared)?;
         }
     }
+    crate::forms::apply_fields(&mut document, &edits.fields)?;
     stamp_metadata(&mut document)?;
     if reshaped {
         document.prune_objects();
@@ -313,6 +538,7 @@ pub fn export_pdf(bytes: &[u8], edits: &Edits) -> Result<Vec<u8>, String> {
 pub(crate) mod tests {
     use super::*;
     use crate::create_sample;
+    use crate::reader::Frame;
     use crate::reader::tests::engine;
     use ethos_core::{InkColor, LoadOutcome, PageEntry, Point, Rect};
 
@@ -342,7 +568,7 @@ pub(crate) mod tests {
         document.trailer.set("Root", catalog);
     }
 
-    fn fixture_document() -> Document {
+    pub(crate) fn fixture_document() -> Document {
         let mut document = Document::with_version("1.7");
         let pages = document.new_object_id();
         let resources = helvetica(&mut document);
@@ -457,7 +683,7 @@ pub(crate) mod tests {
 
     fn texts(bytes: &[u8]) -> Vec<String> {
         let engine = engine();
-        let LoadOutcome::Ready { pages } = engine.load(1, bytes.to_vec(), None).unwrap() else {
+        let LoadOutcome::Ready { pages, .. } = engine.load(1, bytes.to_vec(), None).unwrap() else {
             panic!("password prompt");
         };
         (1..=pages.len() as u32)
@@ -478,7 +704,11 @@ pub(crate) mod tests {
     }
 
     fn edits(pages: Vec<PageEntry>, marks: Vec<Mark>) -> Edits {
-        Edits { marks, pages }
+        Edits {
+            marks,
+            pages,
+            fields: Vec::new(),
+        }
     }
 
     fn note(page: u32, text: &str) -> Mark {
@@ -528,7 +758,7 @@ pub(crate) mod tests {
         for marks in [vec![], vec![highlight]] {
             let result = export_pdf(&bytes, &edits(vec![entry(1, Some(270))], marks)).unwrap();
             let outcome = engine().load(1, result.clone(), None).unwrap();
-            let LoadOutcome::Ready { pages } = outcome else {
+            let LoadOutcome::Ready { pages, .. } = outcome else {
                 panic!("password prompt");
             };
             assert_eq!(pages.len(), 1);
@@ -685,6 +915,13 @@ pub(crate) mod tests {
         );
     }
 
+    fn note_text(mark: &Mark) -> &str {
+        match &mark.kind {
+            MarkKind::Text { text, .. } => text,
+            _ => panic!("expected a note"),
+        }
+    }
+
     #[test]
     fn notes_follow_their_source_page_and_deleted_notes_disappear() {
         let marks = (1..=3)
@@ -695,10 +932,12 @@ pub(crate) mod tests {
             &edits(vec![entry(3, Some(0)), entry(1, Some(0))], marks),
         )
         .unwrap();
-        let content = texts(&result);
-        assert!(content[0].contains("Annotation 3"));
-        assert!(content[1].contains("Annotation 1"));
-        assert!(!content.join(" ").contains("Annotation 2"));
+        let (_, marks) = split_marks(&result);
+        let found: Vec<_> = marks
+            .iter()
+            .map(|mark| (mark.page, note_text(mark)))
+            .collect();
+        assert_eq!(found, [(1, "Annotation 3"), (2, "Annotation 1")]);
     }
 
     #[test]
@@ -709,22 +948,55 @@ pub(crate) mod tests {
             &edits(pages, vec![note(1, "First line\nSecond résumé")]),
         )
         .unwrap();
-        let content = &texts(&result)[0];
-        assert!(
-            content.contains("First line") && content.contains("Second résumé"),
-            "{content}"
+        assert_eq!(
+            note_text(&split_marks(&result).1[0]),
+            "First line\nSecond résumé"
         );
     }
 
     #[test]
-    fn highlight_and_pen_marks_export_a_readable_pdf() {
-        let marks = vec![
+    fn signatures_round_trip_and_redactions_never_become_annotations() {
+        let signature = Mark {
+            id: "s".into(),
+            page: 1,
+            color: InkColor::Blue,
+            kind: MarkKind::Signature {
+                strokes: vec![
+                    vec![Point { x: 20.0, y: 20.0 }, Point { x: 60.0, y: 40.0 }],
+                    vec![Point { x: 70.0, y: 20.0 }, Point { x: 90.0, y: 30.0 }],
+                ],
+            },
+        };
+        let redaction = Mark {
+            id: "r".into(),
+            page: 1,
+            color: InkColor::Blue,
+            kind: MarkKind::Redaction {
+                rect: Rect {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 5.0,
+                    height: 5.0,
+                },
+            },
+        };
+        let all_pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let marks = vec![signature.clone(), redaction];
+        let chosen = edits(all_pages, marks);
+        assert_eq!(redaction_pages(&chosen)[0].number, 1);
+        let result = export_pdf(&fixture(), &chosen).unwrap();
+        assert_eq!(annotation_kinds(&result), ["Ink"]);
+        assert_eq!(split_marks(&result).1, [signature]);
+    }
+
+    fn every_mark() -> Vec<Mark> {
+        vec![
             Mark {
                 id: "h".into(),
                 page: 1,
                 color: InkColor::Yellow,
                 kind: MarkKind::Highlight {
-                    text: "Original".into(),
+                    text: "Original 你好".into(),
                     rects: vec![Rect {
                         x: 20.0,
                         y: 345.0,
@@ -735,48 +1007,125 @@ pub(crate) mod tests {
             },
             Mark {
                 id: "p".into(),
-                page: 2,
+                page: 1,
                 color: InkColor::Mint,
                 kind: MarkKind::Pen {
                     points: vec![Point { x: 20.0, y: 20.0 }, Point { x: 100.0, y: 100.0 }],
                 },
             },
-        ];
-        let pages = vec![entry(1, Some(0)), entry(2, Some(90)), entry(3, Some(0))];
-        let result = export_pdf(&fixture(), &edits(pages, marks)).unwrap();
-        assert_eq!(Document::load_mem(&result).unwrap().get_pages().len(), 3);
-        assert!(texts(&result)[0].contains("Original page 1"));
+            note(1, "A note"),
+        ]
+    }
+
+    fn annotation_kinds(bytes: &[u8]) -> Vec<String> {
+        let document = Document::load_mem(bytes).unwrap();
+        let mut kinds = Vec::new();
+        for page in document.get_pages().into_values() {
+            for item in page_annotations(&document, page).unwrap() {
+                let (_, object) = document.dereference(&item).unwrap();
+                let subtype = object.as_dict().unwrap().get(b"Subtype").unwrap();
+                kinds.push(String::from_utf8_lossy(subtype.as_name().unwrap()).into_owned());
+            }
+        }
+        kinds
     }
 
     #[test]
-    fn original_content_cannot_leak_state_into_marks() {
-        let mut document = fixture_document();
-        let first = document.get_pages()[&1];
-        let skewed = document.add_object(Stream::new(
-            Dictionary::new(),
-            b"q 0.5 0 0 0.5 0 0 cm\n".to_vec(),
-        ));
-        document
-            .get_object_mut(first)
-            .and_then(Object::as_dict_mut)
-            .unwrap()
-            .set("Contents", skewed);
-        let result = export_pdf(
-            &save(&mut document),
-            &edits(
-                vec![entry(1, None), entry(2, None), entry(3, None)],
-                vec![note(1, "Placed")],
-            ),
-        )
-        .unwrap();
-        let restored = Document::load_mem(&result).unwrap();
-        let page = restored.get_dictionary(restored.get_pages()[&1]).unwrap();
-        let contents = page.get(b"Contents").unwrap().as_array().unwrap();
+    fn marks_become_standard_annotations_any_pdf_app_can_read() {
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let result = export_pdf(&fixture(), &edits(pages, every_mark())).unwrap();
+        assert_eq!(annotation_kinds(&result), ["Highlight", "Ink", "FreeText"]);
+    }
+
+    #[test]
+    fn saved_marks_come_back_exactly_and_leave_a_clean_file() {
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let result = export_pdf(&fixture(), &edits(pages, every_mark())).unwrap();
+        let (clean, marks) = split_marks(&result);
+        assert_eq!(marks, every_mark());
+        let clean = clean.expect("marks were removed");
+        assert_eq!(annotation_kinds(&clean), Vec::<String>::new());
+        assert_eq!(split_marks(&clean), (None, Vec::new()));
+        assert_eq!(texts(&clean), texts(&fixture()));
+    }
+
+    #[test]
+    fn files_without_ethos_marks_are_left_alone() {
+        assert_eq!(split_marks(&fixture()), (None, Vec::new()));
         assert_eq!(
-            contents.len(),
-            3,
-            "wrapped original between save and restore"
+            split_marks(b"%PDF-1.7 /EthosMark but damaged"),
+            (None, Vec::new())
         );
+    }
+
+    #[test]
+    fn protected_copies_keep_their_marks_and_stay_openable() {
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let marked = export_pdf(&fixture(), &edits(pages, vec![note(1, "Kept")])).unwrap();
+        let locked = crate::protect_pdf(&marked, "secret").unwrap();
+        assert_eq!(split_marks(&locked), (None, Vec::new()));
+        let engine = engine();
+        let outcome = engine.load(1, locked, Some("secret".into())).unwrap();
+        assert!(matches!(outcome, LoadOutcome::Ready { .. }));
+    }
+
+    #[test]
+    fn annotations_from_other_apps_survive_a_round_trip() {
+        let mut document = fixture_document();
+        let foreign = document.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Text",
+            "Rect" => vec![10.into(), 10.into(), 30.into(), 30.into()],
+            "Contents" => Object::string_literal("From another app"),
+        });
+        let first = document.get_pages()[&1];
+        set_page_annotations(&mut document, first, vec![foreign.into()]).unwrap();
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let result =
+            export_pdf(&save(&mut document), &edits(pages, vec![note(1, "Mine")])).unwrap();
+        assert_eq!(annotation_kinds(&result), ["Text", "FreeText"]);
+        let (clean, marks) = split_marks(&result);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(annotation_kinds(&clean.unwrap()), ["Text"]);
+    }
+
+    #[test]
+    fn appearances_render_for_viewers_that_do_not_know_ethos() {
+        let render = |bytes: Vec<u8>| {
+            let engine = engine();
+            engine.load(1, bytes, None).unwrap();
+            let frame = Frame {
+                token: 1,
+                source: 1,
+                rotation: 0,
+                width: 310,
+                height: 400,
+            };
+            engine.render(1, frame).unwrap()
+        };
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let marked = export_pdf(&fixture(), &edits(pages, vec![note(1, "Visible")])).unwrap();
+        assert_ne!(render(marked), render(fixture()));
+    }
+
+    #[test]
+    fn page_content_is_never_rewritten() {
+        let pages = vec![entry(1, None), entry(2, None), entry(3, None)];
+        let source = fixture();
+        let result = export_pdf(&source, &edits(pages, every_mark())).unwrap();
+        let contents = |bytes: &[u8]| {
+            let document = Document::load_mem(bytes).unwrap();
+            let page = document.get_dictionary(document.get_pages()[&1]).unwrap();
+            let id = page.get(b"Contents").unwrap().as_reference().unwrap();
+            document
+                .get_object(id)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .clone()
+        };
+        assert_eq!(contents(&result), contents(&source));
     }
 
     #[test]

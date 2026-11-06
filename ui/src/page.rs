@@ -4,7 +4,9 @@ use std::cell::OnceCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use ethos_core::{InkColor, Mark, MarkKind, PageInfo, Point, Rect, TextRun, Viewport};
+use ethos_core::{
+    FieldKind, FormField, InkColor, Mark, MarkKind, PageInfo, Point, Rect, TextRun, Viewport,
+};
 use js_sys::{Object, Reflect};
 use leptos::ev;
 use leptos::html;
@@ -18,6 +20,8 @@ use web_sys::{
 };
 
 use crate::bridge::{self, RenderRequest};
+use crate::controls::Icon;
+use crate::icons;
 use crate::store::{Store, Tool};
 
 const MAX_CANVAS_PIXELS: f64 = 4_000_000.0;
@@ -64,8 +68,11 @@ fn opaque_context(canvas: &HtmlCanvasElement) -> Result<CanvasRenderingContext2d
 }
 
 /// Sizes `canvas` to `request` and paints the page into it.
-async fn paint(canvas: &HtmlCanvasElement, request: RenderRequest) -> Result<(), String> {
+async fn paint(canvas: &HtmlCanvasElement, request: RenderRequest) -> Result<bool, String> {
+    const SAMPLES: u32 = 4000;
     let pixels = bridge::render_page(request).await?;
+    let step = (pixels.length() / 4 / SAMPLES).max(1) * 4;
+    let has_ink = (0..pixels.length() / step).any(|index| pixels.get_index(index * step) < 225);
     canvas.set_width(request.width);
     canvas.set_height(request.height);
     let context = opaque_context(canvas)?;
@@ -74,7 +81,8 @@ async fn paint(canvas: &HtmlCanvasElement, request: RenderRequest) -> Result<(),
             .map_err(|_| "This page could not be displayed.".to_owned())?;
     context
         .put_image_data(&image, 0.0, 0.0)
-        .map_err(|_| "This page could not be displayed.".to_owned())
+        .map_err(|_| "This page could not be displayed.".to_owned())?;
+    Ok(has_ink)
 }
 
 thread_local! {
@@ -150,9 +158,225 @@ fn polyline_points(points: &[Point], viewport: Viewport) -> String {
         .join(" ")
 }
 
+fn view_corners(rect: &Rect, viewport: Viewport) -> (Point, Point) {
+    (
+        viewport.to_view(Point {
+            x: rect.x,
+            y: rect.y,
+        }),
+        viewport.to_view(Point {
+            x: rect.x + rect.width,
+            y: rect.y + rect.height,
+        }),
+    )
+}
+
+/// A placed signature, which follows the pointer 1:1 from wherever it was grabbed.
+#[component]
+fn SignatureMark(id: String, strokes: Vec<Vec<Point>>, viewport: Viewport) -> impl IntoView {
+    let store = expect_context::<Store>();
+    let offset = RwSignal::new((0.0_f64, 0.0_f64));
+    let start = StoredValue::new(None::<(f64, f64)>);
+    let id = StoredValue::new(id);
+    let down = move |event: ev::PointerEvent| {
+        if event.button() != 0 {
+            return;
+        }
+        event.stop_propagation();
+        if let Some(target) = event
+            .current_target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        {
+            let _ = target.set_pointer_capture(event.pointer_id());
+        }
+        start.set_value(Some((
+            f64::from(event.client_x()),
+            f64::from(event.client_y()),
+        )));
+    };
+    let moved = move |event: ev::PointerEvent| {
+        if let Some((x, y)) = start.get_value() {
+            offset.set((
+                f64::from(event.client_x()) - x,
+                f64::from(event.client_y()) - y,
+            ));
+        }
+    };
+    let up = move |_: ev::PointerEvent| {
+        if start.get_value().is_none() {
+            return;
+        }
+        start.set_value(None);
+        let (dx, dy) = offset.get_untracked();
+        if dx != 0.0 || dy != 0.0 {
+            let origin = viewport.to_pdf(Point { x: 0.0, y: 0.0 });
+            let target = viewport.to_pdf(Point { x: dx, y: dy });
+            store.move_signature(
+                &id.get_value(),
+                Point {
+                    x: target.x - origin.x,
+                    y: target.y - origin.y,
+                },
+            );
+        }
+        offset.set((0.0, 0.0));
+    };
+    let paths = strokes
+        .iter()
+        .map(|stroke| polyline_points(stroke, viewport))
+        .collect::<Vec<_>>();
+    let outline = paths.clone();
+    view! {
+        <g
+            class="signature-mark"
+            transform=move || {
+                let (x, y) = offset.get();
+                format!("translate({x} {y})")
+            }
+            on:pointerdown=down
+            on:pointermove=moved
+            on:pointerup=up
+        >
+            {outline
+                .into_iter()
+                .map(|points| view! { <polyline class="signature-hit" points=points></polyline> })
+                .collect_view()}
+            {paths
+                .into_iter()
+                .map(|points| {
+                    view! {
+                        <polyline
+                            points=points
+                            fill="none"
+                            stroke="#1b2a4a"
+                            stroke-width=1.4 * viewport.scale
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                        ></polyline>
+                    }
+                })
+                .collect_view()}
+        </g>
+    }
+}
+
+fn input_style(field: &FormField, viewport: Viewport) -> String {
+    let (a, b) = view_corners(&field.rect, viewport);
+    format!(
+        "left:{}px;top:{}px;width:{}px;height:{}px;font-size:{}px",
+        a.x.min(b.x),
+        a.y.min(b.y),
+        (a.x - b.x).abs(),
+        (a.y - b.y).abs(),
+        ((a.y - b.y).abs() * 0.6).clamp(9.0, 14.0)
+    )
+}
+
+/// One form field drawn over the page. Each finished change is a single undo step.
+#[component]
+fn FieldInput(field: FormField, #[prop(into)] viewport: Signal<Viewport>) -> impl IntoView {
+    let store = expect_context::<Store>();
+    let name = field.name.clone();
+    let style = {
+        let field = field.clone();
+        move || input_style(&field, viewport.get())
+    };
+    let value = {
+        let field = field.clone();
+        move || store.field_value(&field)
+    };
+    let commit = move |text: String| store.set_field(name.clone(), text);
+    let control = match field.kind.clone() {
+        FieldKind::Text { multiline: true } => view! {
+            <textarea
+                aria-label=field.name.clone()
+                prop:value=value
+                on:change=move |event| commit(event_target_value(&event))
+            ></textarea>
+        }
+        .into_any(),
+        FieldKind::Text { multiline: false } => view! {
+            <input
+                aria-label=field.name.clone()
+                prop:value=value
+                on:change=move |event| commit(event_target_value(&event))
+            />
+        }
+        .into_any(),
+        FieldKind::Check { on } => {
+            let state = on.clone();
+            let checked = move || value() == state;
+            view! {
+                <input
+                    type="checkbox"
+                    aria-label=field.name.clone()
+                    prop:checked=checked
+                    on:change=move |event| {
+                        let target: web_sys::HtmlInputElement = event_target(&event);
+                        commit(if target.checked() { on.clone() } else { String::new() });
+                    }
+                />
+            }
+            .into_any()
+        }
+        FieldKind::Radio { on } => {
+            let state = on.clone();
+            let checked = move || value() == state;
+            view! {
+                <input
+                    type="radio"
+                    name=field.name.clone()
+                    aria-label=field.name.clone()
+                    prop:checked=checked
+                    on:change=move |_| commit(on.clone())
+                />
+            }
+            .into_any()
+        }
+        FieldKind::Choice { options } => {
+            let current = value.clone();
+            view! {
+                <select
+                    aria-label=field.name.clone()
+                    prop:value=current
+                    on:change=move |event| commit(event_target_value(&event))
+                >
+                    <option value=""></option>
+                    {options
+                        .into_iter()
+                        .map(|option| view! { <option value=option.clone()>{option.clone()}</option> })
+                        .collect_view()}
+                </select>
+            }
+            .into_any()
+        }
+    };
+    view! {
+        <div class="form-field" style=style>
+            {control}
+        </div>
+    }
+}
+
 fn mark_view(mark: Mark, viewport: Viewport) -> impl IntoView + use<> {
     let scale = viewport.scale;
     match mark.kind {
+        MarkKind::Signature { strokes } => {
+            view! { <SignatureMark id=mark.id strokes=strokes viewport=viewport /> }.into_any()
+        }
+        MarkKind::Redaction { rect } => {
+            let (a, b) = view_corners(&rect, viewport);
+            view! {
+                <rect
+                    class="redaction-mark"
+                    x=a.x.min(b.x)
+                    y=a.y.min(b.y)
+                    width=(a.x - b.x).abs()
+                    height=(a.y - b.y).abs()
+                ></rect>
+            }
+            .into_any()
+        }
         MarkKind::Highlight { rects, .. } => {
             let ink = mark.color.ink();
             view! {
@@ -341,12 +565,15 @@ pub fn PdfPage(
         let nodes = SendWrapper::new((canvas.clone(), layer.clone()));
         spawn_local(async move {
             let outcome = async {
-                paint(&canvas, request).await?;
+                let has_ink = paint(&canvas, request).await?;
                 task_painted.store(true, Ordering::Relaxed);
                 if task_cancelled.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 let runs = bridge::page_text(token, source).await?;
+                if runs.is_empty() && has_ink && !store.scan_dismissed.get_value() {
+                    store.scanned.set(true);
+                }
                 if !task_cancelled.load(Ordering::Relaxed) {
                     build_text_layer(&layer, &runs, view)
                         .map_err(|_| "This page could not be displayed.".to_owned())?;
@@ -428,9 +655,16 @@ pub fn PdfPage(
         if event.button() != 0 {
             return;
         }
-        if store.tool.get_untracked() == Tool::Text {
-            store.begin_note(source, point_of(&event));
-            return;
+        match store.tool.get_untracked() {
+            Tool::Text => {
+                store.begin_note(source, point_of(&event));
+                return;
+            }
+            Tool::Sign => {
+                store.place_signature(source, point_of(&event));
+                return;
+            }
+            _ => {}
         }
         if let Some(target) = target_of(&event) {
             let _ = target.set_pointer_capture(event.pointer_id());
@@ -438,8 +672,23 @@ pub fn PdfPage(
         capturing.set_value(true);
         draft.set(vec![point_of(&event)]);
     };
+    let hovering = RwSignal::new(None::<Point>);
     let on_pointer_move = move |event: ev::PointerEvent| {
-        if capturing.get_value() && draft.with_untracked(Vec::len) < MAX_STROKE_POINTS {
+        if store.tool.get_untracked() == Tool::Sign {
+            hovering.set(Some(point_of(&event)));
+            return;
+        }
+        if !capturing.get_value() {
+            return;
+        }
+        if store.tool.get_untracked() == Tool::Redact {
+            // A redaction is a box, so only its two corners matter.
+            let corner = point_of(&event);
+            draft.update(|points| {
+                points.truncate(1);
+                points.push(corner);
+            });
+        } else if draft.with_untracked(Vec::len) < MAX_STROKE_POINTS {
             draft.update(|points| points.push(point_of(&event)));
         }
     };
@@ -452,7 +701,19 @@ pub fn PdfPage(
             let _ = target.release_pointer_capture(event.pointer_id());
         }
         let points = draft.get_untracked();
-        if points.len() > 1 {
+        if store.tool.get_untracked() == Tool::Redact {
+            if let [from, to] = points[..] {
+                let rect = Rect {
+                    x: from.x.min(to.x),
+                    y: from.y.min(to.y),
+                    width: (from.x - to.x).abs(),
+                    height: (from.y - to.y).abs(),
+                };
+                if rect.width > 2.0 && rect.height > 2.0 {
+                    store.add_redaction(source, rect);
+                }
+            }
+        } else if points.len() > 1 {
             store.add_mark(store.new_mark(source, MarkKind::Pen { points }));
         }
         draft.set(Vec::new());
@@ -467,7 +728,34 @@ pub fn PdfPage(
         let view = viewport.get();
         format!("width:{}px;height:{}px", view.width, view.height)
     };
-    let draws = move || matches!(store.tool.get(), Tool::Pen | Tool::Text) && rendered.get();
+    let draws = move || {
+        matches!(
+            store.tool.get(),
+            Tool::Pen | Tool::Text | Tool::Sign | Tool::Redact
+        ) && rendered.get()
+    };
+    let fields = Memo::new(move |_| {
+        let page_fields = store.fields.read();
+        page_fields
+            .iter()
+            .filter(|field| field.page == source)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let changed = Memo::new(move |_| {
+        store
+            .changes
+            .read()
+            .as_ref()
+            .map_or_else(Vec::new, |comparison| {
+                comparison
+                    .changes
+                    .iter()
+                    .filter(|change| change.page == source)
+                    .flat_map(|change| change.rects.clone())
+                    .collect::<Vec<_>>()
+            })
+    });
     let draft_stroke =
         move || -> Option<InkColor> { (!draft.with(Vec::is_empty)).then(|| store.color.get()) };
 
@@ -493,7 +781,62 @@ pub fn PdfPage(
                         marks.get().into_iter().map(|mark| mark_view(mark, view)).collect_view()
                     }}
                     {move || {
+                        let view = viewport.get();
+                        changed
+                            .get()
+                            .iter()
+                            .map(|rect| {
+                                let (a, b) = view_corners(rect, view);
+                                view! {
+                                    <rect
+                                        class="change-mark"
+                                        x=a.x.min(b.x) - 2.0
+                                        y=a.y.min(b.y) - 1.0
+                                        width=(a.x - b.x).abs() + 4.0
+                                        height=(a.y - b.y).abs() + 2.0
+                                        rx="2"
+                                    ></rect>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                    {move || {
+                        let center = hovering.get().filter(|_| store.tool.get() == Tool::Sign)?;
+                        let view = viewport.get();
+                        let strokes = store.signature_at(center)?;
+                        let paths = strokes
+                            .iter()
+                            .map(|stroke| {
+                                view! {
+                                    <polyline
+                                        class="signature-preview"
+                                        points=polyline_points(stroke, view)
+                                        stroke-width=1.4 * view.scale
+                                    ></polyline>
+                                }
+                            })
+                            .collect_view();
+                        Some(paths)
+                    }}
+                    {move || {
+                        let box_points = (store.tool.get() == Tool::Redact).then(|| draft.get()).filter(|points| points.len() == 2);
+                        box_points.map(|points| {
+                            let view = viewport.get();
+                            let (a, b) = (view.to_view(points[0]), view.to_view(points[1]));
+                            view! {
+                                <rect
+                                    class="redaction-draft"
+                                    x=a.x.min(b.x)
+                                    y=a.y.min(b.y)
+                                    width=(a.x - b.x).abs()
+                                    height=(a.y - b.y).abs()
+                                ></rect>
+                            }
+                        })
+                    }}
+                    {move || {
                         draft_stroke()
+                            .filter(|_| store.tool.get() != Tool::Redact)
                             .map(|color| {
                                 view! {
                                     <polyline
@@ -510,6 +853,11 @@ pub fn PdfPage(
                             })
                     }}
                 </svg>
+                <For
+                    each=move || fields.get()
+                    key=|field| (field.name.clone(), (field.rect.x * 10.0) as i64)
+                    children=move |field| view! { <FieldInput field=field viewport=viewport /> }
+                />
                 <Show when=draws>
                     <div
                         class="drawing-layer"
@@ -517,6 +865,7 @@ pub fn PdfPage(
                         on:pointermove=on_pointer_move
                         on:pointerup=on_pointer_up
                         on:pointercancel=on_pointer_cancel
+                        on:pointerleave=move |_| hovering.set(None)
                     ></div>
                 </Show>
             </Show>
@@ -532,6 +881,25 @@ pub fn PdfPage(
     }
 }
 
+/// A thumbnail being dragged to a new place in the sidebar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageDrag {
+    pub source: u32,
+    pub from: usize,
+    pub to: usize,
+    pub offset: f64,
+    pub slot: f64,
+}
+
+/// Where the page with center `center` belongs among thumbnails with the given centers.
+fn nearest_slot(centers: &[f64], center: f64) -> usize {
+    centers
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - center).abs().total_cmp(&(*b - center).abs()))
+        .map_or(0, |(index, _)| index)
+}
+
 #[component]
 pub fn Thumbnail(
     token: u64,
@@ -540,8 +908,158 @@ pub fn Thumbnail(
     #[prop(into)] rotation: Signal<u16>,
     #[prop(into)] index: Signal<usize>,
     #[prop(into)] active: Signal<bool>,
-    #[prop(into)] on_click: Callback<()>,
+    #[prop(into)] selected: Signal<bool>,
+    drag: RwSignal<Option<PageDrag>>,
+    settling: RwSignal<Option<(u32, f64)>>,
 ) -> impl IntoView {
+    const DRAG_THRESHOLD: f64 = 6.0;
+    const EDGE: f64 = 36.0;
+    let store = expect_context::<Store>();
+    let pressed = StoredValue::new(None::<f64>);
+    let centers = StoredValue::new(Vec::<f64>::new());
+    let dragged_last = StoredValue::new(false);
+    let target_of = |event: &ev::PointerEvent| {
+        event
+            .current_target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+    };
+    let on_down = move |event: ev::PointerEvent| {
+        dragged_last.set_value(false);
+        if event.button() == 0 && !event.ctrl_key() && !event.shift_key() {
+            pressed.set_value(Some(f64::from(event.client_y())));
+            if let Some(target) = target_of(&event) {
+                let _ = target.set_pointer_capture(event.pointer_id());
+            }
+        }
+    };
+    let on_move = move |event: ev::PointerEvent| {
+        let Some(start) = pressed.get_value() else {
+            return;
+        };
+        let offset = f64::from(event.client_y()) - start;
+        if drag.read_untracked().is_none() {
+            if offset.abs() < DRAG_THRESHOLD {
+                return;
+            }
+            let Ok(nodes) = document().query_selector_all(".thumbnail") else {
+                return;
+            };
+            let rects: Vec<_> = (0..nodes.length())
+                .filter_map(|index| nodes.get(index)?.dyn_into::<Element>().ok())
+                .map(|node| node.get_bounding_client_rect())
+                .collect();
+            let middle = rects
+                .iter()
+                .map(|rect| rect.top() + rect.height() / 2.0)
+                .collect();
+            centers.set_value(middle);
+            let from = index.get_untracked();
+            let slot = rects
+                .get(from + 1)
+                .or(rects.get(from.saturating_sub(1)))
+                .zip(rects.get(from))
+                .map_or(200.0, |(other, own)| (other.top() - own.top()).abs());
+            drag.set(Some(PageDrag {
+                source,
+                from,
+                to: from,
+                offset,
+                slot,
+            }));
+        }
+        let to = centers.with_value(|centers| {
+            let own = centers.get(index.get_untracked()).copied().unwrap_or(0.0);
+            nearest_slot(centers, own + offset)
+        });
+        drag.update(|state| {
+            if let Some(state) = state {
+                state.offset = offset;
+                state.to = to;
+            }
+        });
+        // Dragging to an edge of the list keeps it moving.
+        if let Ok(Some(list)) = document().query_selector(".sidebar-content") {
+            let bounds = list.get_bounding_client_rect();
+            let y = f64::from(event.client_y());
+            if y < bounds.top() + EDGE {
+                list.scroll_by_with_x_and_y(0.0, -8.0);
+            } else if y > bounds.bottom() - EDGE {
+                list.scroll_by_with_x_and_y(0.0, 8.0);
+            }
+        }
+    };
+    let finish = move |commit: bool| {
+        pressed.set_value(None);
+        let Some(state) = drag.get_untracked() else {
+            return;
+        };
+        drag.set(None);
+        dragged_last.set_value(true);
+        if commit && state.to != state.from {
+            let landed = (state.to as f64 - state.from as f64) * state.slot;
+            settling.set(Some((source, state.offset - landed)));
+            let insertion = if state.to > state.from {
+                state.to + 1
+            } else {
+                state.to
+            };
+            store.move_pages(source, insertion);
+        } else {
+            settling.set(Some((source, state.offset)));
+        }
+    };
+    let style = move || {
+        if let Some((page, residual)) = settling.get().filter(|(page, _)| *page == source) {
+            debug_assert_eq!(page, source);
+            return format!("--settle:{residual}px");
+        }
+        let state = drag.read();
+        let Some(state) = state.as_ref() else {
+            return String::new();
+        };
+        if state.source == source {
+            return format!("transform:translateY({}px) scale(1.04)", state.offset);
+        }
+        let here = index.get();
+        if state.from < here && here <= state.to {
+            format!("transform:translateY({}px)", -state.slot)
+        } else if state.to <= here && here < state.from {
+            format!("transform:translateY({}px)", state.slot)
+        } else {
+            String::new()
+        }
+    };
+    let classes = move || {
+        let mut names = String::from("thumbnail");
+        if active.get() {
+            names.push_str(" active");
+        }
+        if selected.get() {
+            names.push_str(" selected");
+        }
+        if drag
+            .read()
+            .as_ref()
+            .is_some_and(|state| state.source == source)
+        {
+            names.push_str(" lifted");
+        }
+        if settling.get().is_some_and(|(page, _)| page == source) {
+            names.push_str(" settling");
+        }
+        names
+    };
+    let on_click = move |event: ev::MouseEvent| {
+        if dragged_last.get_value() {
+            dragged_last.set_value(false);
+            return;
+        }
+        let (adding, extending) = (event.ctrl_key() || event.meta_key(), event.shift_key());
+        store.select_page(source, adding, extending);
+        if !adding && !extending {
+            store.navigate(index.get_untracked() + 1);
+        }
+    };
     let button = NodeRef::<html::Button>::new();
     let canvas = NodeRef::<html::Canvas>::new();
     let visible = RwSignal::new(false);
@@ -591,14 +1109,26 @@ pub fn Thumbnail(
     view! {
         <button
             node_ref=button
-            class=move || if active.get() { "thumbnail active" } else { "thumbnail " }
+            class=classes
+            style=style
             aria-label=move || format!("Go to page {}", index.get() + 1)
             aria-current=move || active.get().then_some("page")
-            on:click=move |_| on_click.run(())
+            aria-pressed=move || selected.get().to_string()
+            on:pointerdown=on_down
+            on:pointermove=on_move
+            on:pointerup=move |_| finish(true)
+            on:pointercancel=move |_| finish(false)
+            on:click=on_click
+            on:animationend=move |_| settling.set(None)
         >
             <div class="thumbnail-paper">
                 <Show when=move || visible.get()>
                     <canvas node_ref=canvas></canvas>
+                </Show>
+                <Show when=move || selected.get()>
+                    <span class="thumbnail-check">
+                        <Icon data=icons::CHECK size=11 />
+                    </span>
                 </Show>
             </div>
             <span>{move || index.get() + 1}</span>

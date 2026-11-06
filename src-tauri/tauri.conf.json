@@ -33,7 +33,11 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
-    "resources": { "pdfium/pdfium.dll": "pdfium.dll", "pdfium/LICENSE": "pdfium-LICENSE.txt" },
+    "resources": {
+      "pdfium/pdfium.dll": "pdfium.dll",
+      "pdfium/LICENSE": "pdfium-LICENSE.txt",
+      "pdfium/licenses/*": "licenses/"
+    },
     "fileAssociations": [
       { "ext": ["pdf"], "name": "PDF document", "description": "PDF document", "role": "Editor" }
     ],

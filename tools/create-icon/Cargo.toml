@@ -3,6 +3,7 @@ name = "create-icon"
 description = "Generates ethos icons from the approved Rising knot artwork"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

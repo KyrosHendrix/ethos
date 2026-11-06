@@ -4,10 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ethos_core::{MAX_FILE_SIZE, RecentFile};
+use ethos_core::{Edits, MAX_FILE_SIZE, RecentFile};
 use rusty_leveldb::{DB, LdbIterator, Options};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_RECENT: usize = 8;
 
@@ -39,6 +40,9 @@ pub struct Opened {
     pub name: String,
     pub bytes: Vec<u8>,
     pub source: Source,
+    /// Content hash, so saved edits follow the file through renames and moves, and a
+    /// changed file never receives coordinates meant for different pages.
+    pub key: String,
 }
 
 fn is_pdf(path: &Path) -> bool {
@@ -68,10 +72,12 @@ pub fn read_pdf(path: &Path) -> Result<Opened, String> {
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or("Choose a PDF file.")?;
     let path = dunce::canonicalize(path).map_err(|error| error.to_string())?;
+    let key = format!("{:x}", Sha256::digest(&bytes));
     Ok(Opened {
         name,
         bytes,
         source: Source { path },
+        key,
     })
 }
 
@@ -170,6 +176,65 @@ pub fn read_saved_theme(directory: &Path) -> Option<String> {
     theme
 }
 
+fn session_path(directory: &Path, key: &str) -> PathBuf {
+    directory.join("marks").join(format!("{key}.json"))
+}
+
+/// Atomically records a document's edits, so a crash cannot leave half a file.
+pub fn write_session(directory: &Path, key: &str, edits: &Edits) -> Result<(), String> {
+    const FAILED: &str = "Your marks could not be saved.";
+    let target = session_path(directory, key);
+    let parent = target.parent().ok_or(FAILED)?;
+    fs::create_dir_all(parent).map_err(|_| FAILED)?;
+    let text = serde_json::to_string(edits).map_err(|_| FAILED)?;
+    let temporary = target.with_extension("tmp");
+    fs::write(&temporary, text).map_err(|_| FAILED)?;
+    fs::rename(temporary, target).map_err(|_| FAILED.to_owned())
+}
+
+/// Saved edits that fit a document of `page_count` pages. Anything else is ignored.
+pub fn read_session(directory: &Path, key: &str, page_count: usize) -> Option<Edits> {
+    let text = fs::read_to_string(session_path(directory, key)).ok()?;
+    let edits: Edits = serde_json::from_str(&text).ok()?;
+    let exists = |page: u32| page >= 1 && page as usize <= page_count;
+    let valid = !edits.pages.is_empty()
+        && edits.pages.iter().all(|entry| {
+            exists(entry.source)
+                && entry
+                    .rotation
+                    .is_none_or(|rotation| rotation % 90 == 0 && rotation < 360)
+        })
+        && edits.marks.iter().all(|mark| exists(mark.page));
+    valid.then_some(edits)
+}
+
+/// A file name without its folder or `.pdf` ending.
+pub fn stem_of(name: &str) -> String {
+    let path = Path::new(name);
+    path.file_stem().map_or_else(
+        || name.to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
+}
+
+/// `path`, or the first free `name (2).ext` beside it.
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy());
+    (2..)
+        .map(|number| match &extension {
+            Some(extension) => path.with_file_name(format!("{stem} ({number}).{extension}")),
+            None => path.with_file_name(format!("{stem} ({number})")),
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("a free name exists")
+}
+
 pub fn suggested_copy_name(name: &str) -> String {
     let base = Path::new(name).file_name().map_or_else(
         || name.to_owned(),
@@ -185,8 +250,8 @@ pub fn suggested_copy_name(name: &str) -> String {
 
 /// Atomically writes `bytes` to `destination` unless that would replace an original PDF.
 pub fn write_copy(destination: &Path, bytes: &[u8], sources: &[PathBuf]) -> Result<(), String> {
-    if !destination.is_absolute() || !is_pdf(destination) {
-        return Err("Choose an absolute PDF destination.".into());
+    if !destination.is_absolute() {
+        return Err("Choose an absolute destination.".into());
     }
     if destination.exists() && !destination.is_file() {
         return Err("A folder uses this name. Choose a different filename.".into());
@@ -323,7 +388,6 @@ mod tests {
                 .contains("A folder")
         );
         assert!(write_copy(Path::new("copy.pdf"), b"x", &[]).is_err());
-        assert!(write_copy(&folder.join("copy.txt"), b"x", &[]).is_err());
         fs::remove_dir_all(folder).unwrap();
     }
 
@@ -339,6 +403,55 @@ mod tests {
             database.compact_range(b"\x00", b"\xff").unwrap();
         }
         database.close().unwrap();
+    }
+
+    fn edits(source: u32) -> Edits {
+        Edits {
+            fields: Vec::new(),
+            marks: Vec::new(),
+            pages: vec![ethos_core::PageEntry {
+                source,
+                rotation: Some(90),
+            }],
+        }
+    }
+
+    #[test]
+    fn sessions_round_trip_and_reject_what_no_longer_fits() {
+        let folder = directory("session");
+        assert_eq!(read_session(&folder, "key", 3), None);
+        write_session(&folder, "key", &edits(3)).unwrap();
+        assert_eq!(read_session(&folder, "key", 3), Some(edits(3)));
+        assert_eq!(
+            read_session(&folder, "key", 2),
+            None,
+            "page 3 does not exist"
+        );
+        fs::write(session_path(&folder, "key"), "{").unwrap();
+        assert_eq!(
+            read_session(&folder, "key", 3),
+            None,
+            "damaged files are ignored"
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn the_key_follows_content_not_location() {
+        let folder = directory("key");
+        let (first, second) = (folder.join("a.pdf"), folder.join("b.pdf"));
+        fs::write(&first, "%PDF-1.7 same").unwrap();
+        fs::write(&second, "%PDF-1.7 same").unwrap();
+        assert_eq!(
+            read_pdf(&first).unwrap().key,
+            read_pdf(&second).unwrap().key
+        );
+        fs::write(&second, "%PDF-1.7 changed").unwrap();
+        assert_ne!(
+            read_pdf(&first).unwrap().key,
+            read_pdf(&second).unwrap().key
+        );
+        fs::remove_dir_all(folder).unwrap();
     }
 
     const PACKAGED: &[u8] = b"_file://\x00\x01ethos-theme";
@@ -402,6 +515,16 @@ mod tests {
         let folder = directory("unknown");
         storage(&folder, &[(PACKAGED, b"\x01sepia")], false);
         assert_eq!(read_saved_theme(&folder), None);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn output_names_never_overwrite() {
+        let folder = directory("unique");
+        let first = folder.join("Report - page 1.png");
+        assert_eq!(unique_path(&first), first);
+        fs::write(&first, "x").unwrap();
+        assert_eq!(unique_path(&first), folder.join("Report - page 1 (2).png"));
         fs::remove_dir_all(folder).unwrap();
     }
 

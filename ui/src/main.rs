@@ -8,8 +8,13 @@ mod icons;
 mod page;
 mod sidebar;
 mod store;
+mod tools;
 
 fn main() {
+    // Without this a panic reaches the console as a bare "unreachable".
+    std::panic::set_hook(Box::new(|panic| {
+        web_sys::console::error_1(&panic.to_string().into());
+    }));
     let root = leptos::prelude::document()
         .get_element_by_id("root")
         .and_then(|root| wasm_bindgen::JsCast::dyn_into(root).ok())

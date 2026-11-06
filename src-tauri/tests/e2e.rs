@@ -12,7 +12,8 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use ethos_engine::create_sample;
+use ethos_core::{Mark, MarkKind};
+use ethos_engine::{create_sample, read_fields, split_marks};
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
 use lopdf::{Document, EncryptionState, EncryptionVersion, Object, Permissions};
 use serde_json::{Value, json};
@@ -132,6 +133,9 @@ impl App {
             let Ok(reply) = serde_json::from_str::<Value>(text) else {
                 continue;
             };
+            if reply["method"] == "Runtime.consoleAPICalled" && reply["params"]["type"] == "error" {
+                self.errors.push(reply["params"]["args"].to_string());
+            }
             if reply["method"] == "Runtime.exceptionThrown" {
                 self.errors
                     .push(reply["params"]["exceptionDetails"].to_string());
@@ -442,7 +446,7 @@ fn reader_workflows() {
     println!("draw a stroke and undo it");
     app.click("Draw (D)");
     app.wait("document.querySelector('.pdf-page[data-page=\"1\"] .drawing-layer')");
-    let bounds = app.eval("sized(document.querySelector('.pdf-page[data-page=\"1\"]'))");
+    let bounds = app.eval("sized(document.querySelector('.pdf-page'))");
     let (left, top) = (
         bounds["left"].as_f64().unwrap(),
         bounds["top"].as_f64().unwrap(),
@@ -469,7 +473,7 @@ fn reader_workflows() {
     app.press("t", 84, 0);
     app.wait("document.querySelector('.pdf-page.tool-text .drawing-layer')");
     app.click_at(left + 150.0, top + 220.0);
-    app.wait("document.activeElement === document.querySelector('[aria-label=\"Text note\"]')");
+    app.wait("document.activeElement?.tagName === 'TEXTAREA'");
     app.shot("note-dialog");
     app.fill("[aria-label='Text note']", "Smoke annotation");
     app.eval("[...document.querySelectorAll('[role=dialog] button')].find((node) => node.textContent === 'Add text').click()");
@@ -538,18 +542,16 @@ fn reader_workflows() {
         fs::read_to_string(app.profile.join("save-suggestion.txt")).unwrap(),
         "A little more room to think - edited.pdf"
     );
-    let saved = Document::load_mem(&fs::read(&output).unwrap()).unwrap();
+    let saved_bytes = fs::read(&output).unwrap();
+    let saved = Document::load_mem(&saved_bytes).unwrap();
     assert_eq!(saved.get_pages().len(), 4);
     let first = saved.get_dictionary(saved.get_pages()[&1]).unwrap();
     assert_eq!(first.get(b"Rotate").unwrap().as_i64().unwrap(), 90);
-    let contents = first.get(b"Contents").unwrap().as_array().unwrap();
-    let last = contents.last().unwrap().as_reference().unwrap();
-    let annotations = saved.get_object(last).unwrap().as_stream().unwrap();
-    let hex: String = "Smoke annotation"
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert!(String::from_utf8_lossy(&annotations.content).contains(&hex));
+    let (_, marks) = split_marks(&saved_bytes);
+    assert!(
+        matches!(&marks[..], [Mark { kind: MarkKind::Text { text, .. }, .. }] if text == "Smoke annotation"),
+        "{marks:?}"
+    );
     app.wait("!document.querySelector('.dirty-dot')");
 
     println!("open dialog loads a PDF and recents reopen it");
@@ -591,7 +593,7 @@ fn reader_workflows() {
 
     println!("dark appearance persists across reloads");
     app.click("Use dark appearance");
-    app.wait("document.documentElement.dataset.theme === 'dark'");
+    app.wait("document.documentElement?.dataset.theme === 'dark'");
     app.eval("(location.reload(), true)");
     sleep(Duration::from_millis(800));
     app.wait("named('Open sample')");
@@ -625,6 +627,46 @@ fn reader_workflows() {
     app.press("Escape", 27, 0);
     app.wait_count("[role=dialog]", 0);
 
+    app.finish();
+}
+
+#[test]
+fn sidebar_icons_align_with_toggle() {
+    let folder = Folder::new("sidebar-alignment");
+    let mut app = App::launch(&folder.0, 9356, &[]);
+    app.wait("named('Open sample')");
+    for width in [1100, 1440] {
+        app.send(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": width, "height": 900, "deviceScaleFactor": 1, "mobile": false }),
+        );
+        for expanded in [true, false] {
+            if app.eval("named('Toggle sidebar').getAttribute('aria-expanded') === 'true'")
+                != expanded
+            {
+                app.click("Toggle sidebar");
+            }
+            let selector = if expanded {
+                ".library-sidebar > .nav-item > svg"
+            } else {
+                ".library-shell .sidebar-rail svg"
+            };
+            app.wait_count(selector, if expanded { 3 } else { 2 });
+            if expanded {
+                app.wait("Math.abs(document.querySelector('.library-sidebar').getBoundingClientRect().left) < 0.1");
+            }
+            let centers = app.eval(&format!(
+                "[...document.querySelectorAll({selector:?})].map(node => sized(node).x)"
+            ));
+            let toggle = app.eval("sized(named('Toggle sidebar').querySelector('svg')).x");
+            for center in centers.as_array().unwrap() {
+                assert!(
+                    (center.as_f64().unwrap() - toggle.as_f64().unwrap()).abs() < 0.5,
+                    "sidebar icons must align at width {width}, expanded={expanded}: {centers} vs {toggle}"
+                );
+            }
+        }
+    }
     app.finish();
 }
 
@@ -711,6 +753,622 @@ fn dropped_file_opens() {
     app.send("Input.dispatchDragEvent", drag("dragOver", text));
     sleep(Duration::from_millis(200));
     assert_eq!(app.count(".drop-overlay"), 0, "dragged text is not a file");
+
+    // Reloading must reinstall the bridge, and a second drop must keep every file.
+    app.send("Page.reload", json!({}));
+    app.wait("named('Open sample')");
+    let second = folder.0.join("Another.pdf");
+    fs::write(&second, create_sample().unwrap()).unwrap();
+    let files = json!({ "items": [], "files": [file, second], "dragOperationsMask": 1 });
+    app.send("Input.dispatchDragEvent", drag("dragEnter", files.clone()));
+    app.send("Input.dispatchDragEvent", drag("dragOver", files.clone()));
+    app.send("Input.dispatchDragEvent", drag("drop", files));
+    app.wait("document.querySelector('[role=dialog]')?.innerText.includes('Combine PDFs')");
+    app.wait_count(".file-row", 2);
+    app.wait_text("Dropped.pdf");
+    app.wait_text("Another.pdf");
+    app.finish();
+}
+
+/// Places a note on the first page through the real interface.
+fn add_note(app: &mut App, text: &str) {
+    app.rendered();
+    let (x, y) = app.center("document.querySelector('.document-heading')");
+    app.click_at(x, y);
+    app.press("t", 84, 0);
+    app.wait("document.querySelector('.pdf-page[data-page=\"1\"].tool-text .drawing-layer')");
+    let bounds = app.eval("sized(document.querySelector('.pdf-page[data-page=\"1\"]'))");
+    let (left, top) = (
+        bounds["left"].as_f64().unwrap(),
+        bounds["top"].as_f64().unwrap(),
+    );
+    app.click_at(left + 150.0, top + 220.0);
+    app.wait("document.activeElement?.tagName === 'TEXTAREA'");
+    app.fill("[aria-label='Text note']", text);
+    app.eval("[...document.querySelectorAll('[role=dialog] button')].find((node) => node.textContent === 'Add text').click()");
+    app.wait_count("[role=dialog]", 0);
+}
+
+/// Marks survive closing without saving, restarting, and a trip through a saved copy.
+#[test]
+fn marks_last_without_saving() {
+    let folder = Folder::new("marks");
+    let file = folder.0.join("Notes.pdf");
+    let copy = folder.0.join("Copy.pdf");
+    fs::write(&file, create_sample().unwrap()).unwrap();
+    let original = fs::read(&file).unwrap();
+    {
+        let mut app = App::launch(&folder.0, 9352, &[file.as_path()]);
+        add_note(&mut app, "Kept for later");
+        app.wait_count(".annotation-layer text", 1);
+        app.wait("!document.querySelector('.dirty-dot')");
+
+        println!("leaving asks nothing and loses nothing");
+        app.click("Library");
+        app.wait("named('Notes.pdf')");
+        assert_eq!(app.count("[role=dialog]"), 0);
+        app.click("Notes.pdf");
+        app.wait_text("Your marks are back.");
+        app.wait_count(".annotation-layer text", 1);
+        app.finish();
+    }
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        original,
+        "the original never changes"
+    );
+
+    println!("marks survive a restart");
+    let mut app = App::launch(&folder.0, 9353, &[file.as_path()]);
+    app.wait_text("Your marks are back.");
+    app.wait_count(".annotation-layer text", 1);
+
+    println!("a saved copy reopens with marks that can still be edited");
+    app.script_dialog("save-dialog.txt", &copy);
+    app.control('s');
+    app.wait_text("Copy saved.");
+    app.script_dialog("open-dialog.txt", &copy);
+    app.control('o');
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'Copy'");
+    app.rendered();
+    app.wait_count(".annotation-layer text", 1);
+    let (x, y) = app.center("document.querySelector('#document-tab-notes')");
+    app.click_at(x, y);
+    app.wait_count(".note-item", 1);
+    app.click("Remove annotation");
+    app.wait_count(".annotation-layer text", 0);
+
+    println!("undo brings back what a restored session changed");
+    app.click("Library");
+    app.wait("named('Notes.pdf')");
+    app.click("Notes.pdf");
+    app.wait_text("Your marks are back.");
+    app.wait_count(".annotation-layer text", 1);
+    app.click("Undo");
+    app.wait_count(".annotation-layer text", 0);
+    app.finish();
+}
+
+/// If edits cannot reach disk, leaving still asks first.
+#[test]
+fn failed_autosave_still_asks_before_leaving() {
+    let folder = Folder::new("blocked");
+    let file = folder.0.join("Blocked.pdf");
+    fs::write(&file, create_sample().unwrap()).unwrap();
+    let profile = folder.0.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(profile.join("marks"), "a file where the folder should go").unwrap();
+    let mut app = App::launch(&folder.0, 9354, &[file.as_path()]);
+    add_note(&mut app, "At risk");
+    app.wait("document.querySelector('.dirty-dot')");
+    sleep(Duration::from_millis(500));
+    app.wait("document.querySelector('.dirty-dot')");
+    app.click("Library");
+    app.wait("document.querySelector('[role=dialog]')?.innerText.includes('Keep your changes?')");
+    app.click("Keep editing");
+    app.wait_count("[role=dialog]", 0);
+    assert_eq!(app.count(".annotation-layer text"), 1);
+    app.finish();
+}
+
+/// Finds and runs a tool the way someone would: Ctrl K, a few letters, Enter.
+fn run_from_palette(app: &mut App, query: &str) {
+    app.control('k');
+    app.wait("document.activeElement?.getAttribute('aria-label') === 'Find a tool'");
+    app.send("Input.insertText", json!({ "text": query }));
+    app.wait("document.querySelector('.tool-row[data-highlighted]')");
+    app.press("Enter", 13, 0);
+    app.wait_count(".palette", 0);
+}
+
+fn drag(app: &mut App, from: (f64, f64), to: (f64, f64)) {
+    app.mouse("mouseMoved", from.0, from.1, 0);
+    app.mouse("mousePressed", from.0, from.1, 1);
+    for step in 1..=12 {
+        let step = f64::from(step) / 12.0;
+        app.mouse(
+            "mouseMoved",
+            from.0 + (to.0 - from.0) * step,
+            from.1 + (to.1 - from.1) * step,
+            1,
+        );
+    }
+    app.mouse("mouseReleased", to.0, to.1, 0);
+}
+
+fn dismiss_toast(app: &mut App) {
+    app.wait("document.querySelector('.toast')");
+    app.click("Dismiss message");
+    app.wait_count(".toast", 0);
+}
+
+fn form_pdf() -> Vec<u8> {
+    use lopdf::{Dictionary, Stream, dictionary};
+    let mut document = Document::load_mem(&create_sample().unwrap()).unwrap();
+    let first = document.get_pages()[&1];
+    let on = document.add_object(Stream::new(Dictionary::new(), b"q Q\n".to_vec()));
+    let off = document.add_object(Stream::new(Dictionary::new(), b"q Q\n".to_vec()));
+    let rect = |x: i64, y: i64, w: i64, h: i64| -> Vec<Object> {
+        vec![x.into(), y.into(), (x + w).into(), (y + h).into()]
+    };
+    let text = document.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+        "T" => Object::string_literal("full name"), "Rect" => rect(56, 280, 240, 26), "P" => first,
+    });
+    let check = document.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn",
+        "T" => Object::string_literal("agree"), "V" => "Off", "AS" => "Off",
+        "Rect" => rect(56, 240, 18, 18), "P" => first,
+        "AP" => dictionary! { "N" => dictionary! { "Yes" => on, "Off" => off } },
+    });
+    document
+        .get_object_mut(first)
+        .and_then(Object::as_dict_mut)
+        .unwrap()
+        .set("Annots", vec![text.into(), check.into()]);
+    let form = document.add_object(dictionary! { "Fields" => vec![text.into(), check.into()] });
+    document.catalog_mut().unwrap().set("AcroForm", form);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn pdf_text(bytes: &[u8]) -> String {
+    let document = Document::load_mem(bytes).unwrap();
+    let mut text = Vec::new();
+    for number in document.get_pages().keys() {
+        text.push(document.extract_text(&[*number]).unwrap_or_default());
+    }
+    text.join(" ")
+}
+
+/// Every tool, through the interface, checking the real file it produces.
+#[test]
+fn tools_produce_real_files() {
+    let folder = Folder::new("tools");
+    let source = folder.0.join("Report.pdf");
+    fs::write(&source, create_sample().unwrap()).unwrap();
+    let out = |name: &str| folder.0.join(name);
+    let parts = folder.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let mut app = App::launch(&folder.0, 9355, &[source.as_path()]);
+    app.rendered();
+    let script_folder = |app: &App, path: &Path| {
+        fs::write(
+            app.profile.join("folder-dialog.txt"),
+            path.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    };
+
+    println!("the tools list opens from the toolbar and filters as you type");
+    app.click("Tools (Ctrl K)");
+    app.wait("document.activeElement?.getAttribute('aria-label') === 'Find a tool'");
+    sleep(Duration::from_millis(250));
+    app.shot("tools-list");
+    assert!(app.count(".tool-row") >= 17);
+    app.send("Input.insertText", json!({ "text": "merge" }));
+    app.wait("document.querySelectorAll('.tool-row').length === 1");
+    assert_eq!(
+        app.eval("document.querySelector('.tool-row').textContent.trim()"),
+        "Combine PDFs"
+    );
+    app.press("Escape", 27, 0);
+    app.wait_count(".palette", 0);
+
+    println!("3 save as plain text, 2 Markdown, 10 Word");
+    app.script_dialog("save-dialog.txt", &out("Report.txt"));
+    run_from_palette(&mut app, "plain text");
+    app.wait_text("Saved Report.txt.");
+    sleep(Duration::from_millis(300));
+    app.shot("tool-done");
+    dismiss_toast(&mut app);
+    assert!(
+        fs::read_to_string(out("Report.txt"))
+            .unwrap()
+            .contains("The best tools give you space.")
+    );
+    app.script_dialog("save-dialog.txt", &out("Report.md"));
+    run_from_palette(&mut app, "markdown");
+    dismiss_toast(&mut app);
+    assert!(
+        fs::read_to_string(out("Report.md"))
+            .unwrap()
+            .contains("# A little more room to think")
+    );
+    app.script_dialog("save-dialog.txt", &out("Report.docx"));
+    run_from_palette(&mut app, "save as word");
+    dismiss_toast(&mut app);
+    assert_eq!(&fs::read(out("Report.docx")).unwrap()[..2], b"PK");
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        create_sample().unwrap(),
+        "tools never touch the original"
+    );
+
+    println!("12 pages as pictures");
+    script_folder(&app, &parts);
+    run_from_palette(&mut app, "as pictures");
+    app.wait(
+        "document.querySelector('[role=dialog]')?.innerText.includes('Save pages as pictures')",
+    );
+    app.shot("pictures-sheet");
+    app.click("Choose a folder");
+    app.wait_text("Saved 4 pictures.");
+    dismiss_toast(&mut app);
+    let picture = parts.join("Report - page 1.png");
+    assert!(picture.exists());
+
+    println!("7 split, with a live count of what it will make");
+    run_from_palette(&mut app, "split");
+    app.fill("[role=dialog] input", "2");
+    app.wait_text("Makes 2 PDFs");
+    app.shot("split-sheet");
+    app.click("Choose a folder");
+    app.wait_text("Split into 2 PDFs.");
+    dismiss_toast(&mut app);
+    assert_eq!(
+        Document::load_mem(&fs::read(parts.join("Report - part 2.pdf")).unwrap())
+            .unwrap()
+            .get_pages()
+            .len(),
+        2
+    );
+
+    println!("8 selecting thumbnails and saving them as a new PDF");
+    let thumbnail = |index: usize| format!("document.querySelectorAll('.thumbnail')[{index}]");
+    app.eval(&format!(
+        "({}.dispatchEvent(new MouseEvent('click', {{ bubbles: true, ctrlKey: true }})), true)",
+        thumbnail(0)
+    ));
+    app.eval(&format!(
+        "({}.dispatchEvent(new MouseEvent('click', {{ bubbles: true, shiftKey: true }})), true)",
+        thumbnail(2)
+    ));
+    app.wait_text("3 selected");
+    app.shot("selection");
+    app.script_dialog("save-dialog.txt", &out("Three.pdf"));
+    app.click("Save as a new PDF");
+    app.wait_text("Saved 3 pages as a new PDF.");
+    dismiss_toast(&mut app);
+    assert_eq!(
+        Document::load_mem(&fs::read(out("Three.pdf")).unwrap())
+            .unwrap()
+            .get_pages()
+            .len(),
+        3
+    );
+
+    println!("9 dragging a thumbnail reorders pages, and undo puts it back");
+    let first = app.center(&thumbnail(0));
+    let third = app.center(&thumbnail(2));
+    app.mouse("mouseMoved", first.0, first.1, 0);
+    app.mouse("mousePressed", first.0, first.1, 1);
+    for step in 1..=12 {
+        let y = first.1 + (third.1 + 10.0 - first.1) * f64::from(step) / 12.0;
+        app.mouse("mouseMoved", first.0, y, 1);
+    }
+    app.wait("document.querySelector('.thumbnail.lifted')");
+    sleep(Duration::from_millis(240));
+    app.shot("reorder-drag");
+    app.mouse("mouseReleased", first.0, third.1 + 10.0, 0);
+    app.wait("!document.querySelector('.thumbnail.lifted')");
+    app.script_dialog("save-dialog.txt", &out("Reordered.pdf"));
+    app.control('s');
+    app.wait_text("Copy saved");
+    dismiss_toast(&mut app);
+    let reordered = Document::load_mem(&fs::read(out("Reordered.pdf")).unwrap()).unwrap();
+    assert!(
+        reordered
+            .extract_text(&[3])
+            .unwrap()
+            .contains("A little more room"),
+        "page one moved to third"
+    );
+    assert!(
+        reordered
+            .extract_text(&[1])
+            .unwrap()
+            .contains("Follow the thought")
+    );
+    app.click("Undo (Ctrl Z)");
+
+    println!("1 highlights and notes export as Markdown");
+    add_note(&mut app, "A thought worth keeping");
+    app.wait_count(".annotation-layer text", 1);
+    run_from_palette(&mut app, "notes");
+    app.wait(
+        "document.querySelector('.notes-preview')?.textContent.includes('A thought worth keeping')",
+    );
+    sleep(Duration::from_millis(280));
+    app.shot("notes-sheet");
+    app.script_dialog("save-dialog.txt", &out("Notes.md"));
+    app.click("Save as a file");
+    app.wait_text("Notes exported.");
+    dismiss_toast(&mut app);
+    assert!(
+        fs::read_to_string(out("Notes.md"))
+            .unwrap()
+            .contains("## Page 1\n\nA thought worth keeping")
+    );
+
+    println!("15 signing: draw once, place, drag");
+    app.press("s", 83, 0);
+    app.wait("document.querySelector('.signature-pad')");
+    let pad = app.center("document.querySelector('.signature-pad')");
+    drag(
+        &mut app,
+        (pad.0 - 120.0, pad.1),
+        (pad.0 + 120.0, pad.1 - 30.0),
+    );
+    app.wait("document.querySelector('.signature-pad path')");
+    sleep(Duration::from_millis(280));
+    app.shot("signature-sheet");
+    app.click("Use this signature");
+    app.wait("document.querySelector('.pdf-page.tool-sign .drawing-layer')");
+    let page = app.eval("sized(document.querySelector('.pdf-page'))");
+    let (left, top) = (
+        page["left"].as_f64().unwrap(),
+        page["top"].as_f64().unwrap(),
+    );
+    app.click_at(left + 300.0, top + 500.0);
+    app.wait_count(".signature-mark", 1);
+    let before = app
+        .eval("document.querySelector('.signature-mark').getBoundingClientRect().left")
+        .as_f64()
+        .unwrap();
+    let grab = app.center("document.querySelector('.signature-mark')");
+    drag(&mut app, grab, (grab.0 + 60.0, grab.1 + 30.0));
+    app.wait(&format!(
+        "document.querySelector('.signature-mark').getBoundingClientRect().left > {before} + 40"
+    ));
+
+    println!("18 redaction removes text for good");
+    app.press("r", 82, 0);
+    app.wait("document.querySelector('.pdf-page.tool-redact .drawing-layer')");
+    let span = app.eval("(() => { const span = [...document.querySelectorAll('.pdf-page[data-page=\"1\"] .textLayer span')].find((node) => node.textContent.includes('The best tools')); const box = span.getBoundingClientRect(); return { left: box.left, right: box.right, top: box.top, bottom: box.bottom }; })()");
+    let number = |key: &str| span[key].as_f64().unwrap();
+    drag(
+        &mut app,
+        (number("left") - 4.0, number("top") - 4.0),
+        (number("right") + 4.0, number("bottom") + 4.0),
+    );
+    app.wait_count(".redaction-mark", 1);
+    app.shot("redaction");
+    app.script_dialog("save-dialog.txt", &out("Redacted.pdf"));
+    app.control('s');
+    app.wait_text("1 area removed for good");
+    dismiss_toast(&mut app);
+    let redacted = fs::read(out("Redacted.pdf")).unwrap();
+    let text = pdf_text(&redacted);
+    assert!(!text.contains("The best tools"), "redacted text survived");
+    assert!(
+        text.contains("Select a passage"),
+        "other pages keep their text"
+    );
+    let saved = Document::load_mem(&redacted).unwrap();
+    assert!(
+        saved
+            .objects
+            .values()
+            .filter_map(|object| object.as_stream().ok())
+            .all(|stream| {
+                let content = stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                !content.windows(14).any(|part| part == b"The best tools")
+            })
+    );
+    let (_, marks) = split_marks(&redacted);
+    assert!(
+        marks
+            .iter()
+            .all(|mark| !matches!(mark.kind, MarkKind::Signature { .. })),
+        "marks on a redacted page are burned in with it"
+    );
+    // Back to a clean document for the remaining tools.
+    for _ in 0..3 {
+        app.click("Undo (Ctrl Z)");
+    }
+
+    println!("15 a signature on an untouched page stays an editable annotation");
+    app.press("s", 83, 0);
+    app.wait("document.querySelector('.pdf-page.tool-sign .drawing-layer')");
+    app.click_at(left + 300.0, top + 500.0);
+    app.wait_count(".signature-mark", 1);
+    app.script_dialog("save-dialog.txt", &out("Signed.pdf"));
+    app.control('s');
+    app.wait_text("Copy saved");
+    dismiss_toast(&mut app);
+    let (_, marks) = split_marks(&fs::read(out("Signed.pdf")).unwrap());
+    assert!(
+        marks
+            .iter()
+            .any(|mark| matches!(mark.kind, MarkKind::Signature { .. }))
+    );
+    app.click("Undo (Ctrl Z)");
+
+    println!("19 a smaller copy reports what it saved");
+    app.script_dialog("save-dialog.txt", &out("Smaller.pdf"));
+    run_from_palette(&mut app, "smaller");
+    app.wait("document.querySelector('.toast')?.innerText.includes('KB') || document.querySelector('.toast')?.innerText.includes('already as small')");
+    dismiss_toast(&mut app);
+    assert!(Document::load_mem(&fs::read(out("Smaller.pdf")).unwrap()).is_ok());
+
+    println!("6 combining keeps the open document first");
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        out("Three.pdf").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    run_from_palette(&mut app, "combine");
+    app.wait("document.querySelector('.file-row:not(.current)')");
+    sleep(Duration::from_millis(280));
+    app.shot("combine-sheet");
+    app.script_dialog("save-dialog.txt", &out("Combined.pdf"));
+    app.click("Save");
+    app.wait_text("Combined 2 PDFs.");
+    dismiss_toast(&mut app);
+    assert_eq!(
+        Document::load_mem(&fs::read(out("Combined.pdf")).unwrap())
+            .unwrap()
+            .get_pages()
+            .len(),
+        7
+    );
+
+    println!("5 comparing finds the differences and jumps to them");
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        out("Three.pdf").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    run_from_palette(&mut app, "compare");
+    app.wait("document.querySelector('.change-row')");
+    app.wait_text("1 change from Three.pdf");
+    app.shot("compare");
+    app.click("Done");
+    app.wait_count(".change-row", 0);
+
+    println!("16 protecting, then 17 removing the password");
+    run_from_palette(&mut app, "password");
+    app.fill("[role=dialog] input[type=password]", "secret");
+    app.eval("document.querySelectorAll('[role=dialog] input')[1].focus()");
+    app.send("Input.insertText", json!({ "text": "typo" }));
+    app.wait_text("These don't match yet.");
+    app.shot("protect-sheet");
+    app.eval("document.querySelectorAll('[role=dialog] input')[1].select()");
+    app.send("Input.insertText", json!({ "text": "secret" }));
+    app.script_dialog("save-dialog.txt", &out("Locked.pdf"));
+    app.wait("!named('Save protected copy').disabled");
+    app.click("Save protected copy");
+    app.wait_text("Saved a protected copy.");
+    app.click("Open");
+    app.wait("document.querySelector('[role=dialog]')?.innerText.includes('A little privacy')");
+    app.fill("[aria-label='PDF password']", "secret");
+    app.press("Enter", 13, 0);
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'Locked'");
+    app.rendered();
+    app.script_dialog("save-dialog.txt", &out("Unlocked.pdf"));
+    run_from_palette(&mut app, "remove");
+    app.wait_text("opens without a password");
+    dismiss_toast(&mut app);
+    assert_eq!(
+        Document::load_mem(&fs::read(out("Unlocked.pdf")).unwrap())
+            .unwrap()
+            .get_pages()
+            .len(),
+        4
+    );
+
+    println!("11 Word to PDF, from the Library");
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        out("Report.docx").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    app.script_dialog("save-dialog.txt", &out("From Word.pdf"));
+    run_from_palette(&mut app, "word to pdf");
+    app.wait_text("Made a PDF from your Word document.");
+    dismiss_toast(&mut app);
+    assert!(pdf_text(&fs::read(out("From Word.pdf")).unwrap()).len() > 100);
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        out("From Word.pdf").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    app.control('o');
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'From Word'");
+    app.rendered();
+    sleep(Duration::from_millis(300));
+    app.shot("word-to-pdf");
+
+    println!("13 pictures to PDF, then 4 OCR makes the scan searchable");
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        picture.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    run_from_palette(&mut app, "pictures to pdf");
+    app.wait("document.querySelector('.file-row')");
+    app.script_dialog("save-dialog.txt", &out("Scan.pdf"));
+    app.click("Save");
+    app.wait_text("Made a PDF from 1 picture.");
+    app.click("Open");
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'Scan'");
+    app.wait("document.querySelector('.scan-hint')");
+    sleep(Duration::from_millis(400));
+    app.shot("scan-hint");
+    app.script_dialog("save-dialog.txt", &out("Scan searchable.pdf"));
+    app.click("Make searchable");
+    app.wait("document.querySelector('.tool-status')");
+    app.wait_text("It can now be searched.");
+    app.click("Open");
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'Scan searchable'");
+    app.control('f');
+    app.fill("[aria-label='Search document']", "attention");
+    app.wait("document.querySelector('.search-result')");
+
+    println!("14 filling in a form");
+    let form = folder.0.join("Form.pdf");
+    fs::write(&form, form_pdf()).unwrap();
+    fs::write(
+        app.profile.join("open-dialog.txt"),
+        form.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    app.control('o');
+    app.wait("document.querySelector('.document-heading')?.innerText.trim() === 'Form'");
+    app.wait("document.querySelector('.form-field input')");
+    sleep(Duration::from_millis(300));
+    run_from_palette(&mut app, "fill");
+    app.wait("document.activeElement?.closest('.form-field')");
+    app.send("Input.insertText", json!({ "text": "Grace Hopper" }));
+    app.press("Tab", 9, 0);
+    app.eval("(document.activeElement.blur(), true)");
+    app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    sleep(Duration::from_millis(300));
+    app.shot("form");
+    app.script_dialog("save-dialog.txt", &out("Filled.pdf"));
+    app.control('s');
+    app.wait_text("Copy saved");
+    let fields = read_fields(&fs::read(out("Filled.pdf")).unwrap());
+    assert_eq!(fields[0].value, "Grace Hopper");
+    assert_eq!(fields[1].value, "Yes");
+
+    println!("the new surfaces hold up in dark mode");
+    app.eval("(named('Use dark appearance').click(), true)");
+    app.wait("document.documentElement.dataset.theme === 'dark'");
+    app.click("Tools (Ctrl K)");
+    app.wait("document.activeElement?.getAttribute('aria-label') === 'Find a tool'");
+    sleep(Duration::from_millis(250));
+    app.shot("tools-list-dark");
+    app.press("Escape", 27, 0);
+    app.wait_count(".palette", 0);
+    run_from_palette(&mut app, "protect");
+    app.wait("document.querySelector('[role=dialog] input')");
+    sleep(Duration::from_millis(300));
+    app.shot("protect-dark");
     app.finish();
 }
 
@@ -732,7 +1390,7 @@ fn earlier_appearance_carries_over() {
     database.flush().unwrap();
     database.close().unwrap();
     let mut app = App::launch(&folder.0, 9350, &[]);
-    app.wait("document.documentElement.dataset.theme === 'dark'");
+    app.wait("document.documentElement?.dataset.theme === 'dark'");
     app.wait("localStorage.getItem('ethos-theme') === 'dark'");
     app.finish();
 }

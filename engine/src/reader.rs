@@ -20,6 +20,8 @@ pub struct Frame {
 }
 
 type Reply<T> = Sender<Result<T, String>>;
+type LibraryWork = Box<dyn FnOnce(Result<&Pdfium, String>) + Send>;
+type TemporaryWork = Box<dyn for<'d> FnOnce(Result<&PdfDocument<'d>, String>) + Send>;
 
 enum Job {
     Load {
@@ -45,6 +47,16 @@ enum Job {
         reply: Reply<Vec<SearchHit>>,
     },
     Close,
+    /// Runs work with the library itself, for tools that create documents.
+    Library {
+        work: LibraryWork,
+    },
+    /// Runs work against a separate document, between other jobs.
+    Temporary {
+        bytes: Vec<u8>,
+        password: Option<String>,
+        work: TemporaryWork,
+    },
 }
 
 /// Handle to the thread that owns PDFium, which is not safe to call concurrently.
@@ -145,6 +157,31 @@ impl Engine {
         })
     }
 
+    /// Opens `bytes` as a second document for the length of `work`, leaving the reader's
+    /// document in place. Long tools call this once per page, so scrolling stays smooth.
+    pub fn with_temporary<T: Send + 'static>(
+        &self,
+        bytes: Vec<u8>,
+        password: Option<String>,
+        work: impl for<'d> FnOnce(&PdfDocument<'d>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        self.ask(|reply| Job::Temporary {
+            bytes,
+            password,
+            work: Box::new(move |document| drop(reply.send(document.and_then(work)))),
+        })
+    }
+
+    /// Runs `work` on the PDFium thread, for tools that build a document from nothing.
+    pub fn with_pdfium<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Pdfium) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        self.ask(|reply| Job::Library {
+            work: Box::new(move |pdfium| drop(reply.send(pdfium.and_then(work)))),
+        })
+    }
+
     pub fn close(&self) {
         // A stopped worker holds no document, so there is nothing left to release.
         let _ = self.jobs.send(Job::Close);
@@ -160,6 +197,8 @@ impl Job {
             Job::Text { reply, .. } => drop(reply.send(Err(error))),
             Job::Search { reply, .. } => drop(reply.send(Err(error))),
             Job::Close => {}
+            Job::Temporary { work, .. } => work(Err(error)),
+            Job::Library { work } => work(Err(error)),
         }
     }
 }
@@ -210,6 +249,21 @@ impl Worker<'_> {
                 self.document = None;
                 self.text = TextCache::default();
             }
+            Job::Library { work } => work(Ok(self.pdfium)),
+            Job::Temporary {
+                bytes,
+                password,
+                work,
+            } => {
+                let document = self
+                    .pdfium
+                    .load_pdf_from_byte_vec(bytes, password.as_deref())
+                    .map_err(|_| "This PDF could not be opened.".to_owned());
+                match &document {
+                    Ok(document) => work(Ok(document)),
+                    Err(error) => work(Err(error.clone())),
+                }
+            }
         }
     }
 
@@ -229,7 +283,7 @@ impl Worker<'_> {
                     incorrect: password.is_some(),
                 });
             }
-            Err(error) => return Err(format!("This PDF could not be opened: {error}")),
+            Err(_) => return Err("This PDF could not be opened. It may be damaged.".into()),
         };
         if document.pages().len() as usize > MAX_PAGES {
             return Err("This version supports documents up to 2,000 pages.".into());
@@ -237,11 +291,17 @@ impl Worker<'_> {
         let pages = document
             .pages()
             .iter()
-            .map(|page| page_info(&page))
+            .map(|page| page_view(&page))
             .collect::<Result<Vec<_>, _>>()?;
         self.document = Some((token, document));
         self.text = TextCache::default();
-        Ok(LoadOutcome::Ready { pages })
+        Ok(LoadOutcome::Ready {
+            pages,
+            marks: Vec::new(),
+            restored: None,
+            fields: Vec::new(),
+            protected: false,
+        })
     }
 
     fn page(&self, token: u64, source: u32) -> Result<PdfPage<'_>, String> {
@@ -276,27 +336,7 @@ impl Worker<'_> {
     }
 
     fn text_runs(&self, token: u64, source: u32) -> Result<Vec<TextRun>, String> {
-        let page = self.page(token, source)?;
-        let text = page.text().map_err(|error| error.to_string())?;
-        let segments = text.segments();
-        let runs = segments
-            .iter()
-            .filter_map(|segment| {
-                let content = segment.text();
-                let bounds = segment.bounds();
-                (!content.trim().is_empty()).then(|| TextRun {
-                    direction: reading_direction(&segment),
-                    text: content.trim_end_matches(['\r', '\n']).to_owned(),
-                    rect: Rect {
-                        x: f64::from(bounds.left().value),
-                        y: f64::from(bounds.bottom().value),
-                        width: f64::from(bounds.width().value),
-                        height: f64::from(bounds.height().value),
-                    },
-                })
-            })
-            .collect();
-        Ok(runs)
+        page_runs(&self.page(token, source)?)
     }
 
     /// Joins the page's lines; `PdfPageText::all` clips to the wrong box on rotated pages.
@@ -334,6 +374,30 @@ impl Worker<'_> {
     }
 }
 
+/// The lines of text on a page.
+pub(crate) fn page_runs(page: &PdfPage) -> Result<Vec<TextRun>, String> {
+    let text = page.text().map_err(|error| error.to_string())?;
+    let segments = text.segments();
+    let runs = segments
+        .iter()
+        .filter_map(|segment| {
+            let content = segment.text();
+            let bounds = segment.bounds();
+            (!content.trim().is_empty()).then(|| TextRun {
+                direction: reading_direction(&segment),
+                text: content.trim_end_matches(['\r', '\n']).to_owned(),
+                rect: Rect {
+                    x: f64::from(bounds.left().value),
+                    y: f64::from(bounds.bottom().value),
+                    width: f64::from(bounds.width().value),
+                    height: f64::from(bounds.height().value),
+                },
+            })
+        })
+        .collect();
+    Ok(runs)
+}
+
 /// shortcut: skewed text snaps to the nearest quarter turn, so selection boxes only
 /// approximate it. Measure each run's real angle if slanted documents matter.
 fn reading_direction(segment: &PdfPageTextSegment) -> u16 {
@@ -369,7 +433,8 @@ fn render_rotation(degrees: u16) -> PdfPageRenderRotation {
     }
 }
 
-fn page_info(page: &PdfPage) -> Result<PageInfo, String> {
+/// A page's size, position and stored rotation.
+pub fn page_view(page: &PdfPage) -> Result<PageInfo, String> {
     let bounds = page
         .boundaries()
         .bounding()
@@ -438,7 +503,7 @@ pub(crate) mod tests {
 
     fn pages(outcome: LoadOutcome) -> Vec<PageInfo> {
         match outcome {
-            LoadOutcome::Ready { pages } => pages,
+            LoadOutcome::Ready { pages, .. } => pages,
             LoadOutcome::Password { .. } => panic!("unexpected password prompt"),
         }
     }

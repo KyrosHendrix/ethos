@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ethos_core::{Mark, PageInfo, StagedFile};
+use ethos_core::{Mark, PageInfo, StagedFile, ToolProgress};
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -20,10 +20,12 @@ use crate::controls::{Icon, IconButton, Tooltips};
 use crate::icons;
 use crate::page::PdfPage;
 use crate::sidebar::{DocumentSidebar, LibraryView};
-use crate::store::{Document, Store, Tab, Tool};
+use crate::store::{Document, PaletteOrigin, Store, Tab, Tool};
+use crate::tools::{Palette, ScanHint, Sheets, ToolStatus};
 
 /// Pages searched between progress updates.
 const SEARCH_BATCH: usize = 16;
+const AUTOSAVE_DELAY_MS: u64 = 300;
 
 fn on_key(store: Store, event: &web_sys::KeyboardEvent) {
     if document()
@@ -40,6 +42,10 @@ fn on_key(store: Store, event: &web_sys::KeyboardEvent) {
     // WebView2 would otherwise act on these browser shortcuts inside a desktop app.
     if key == "F3" || key == "F7" || (modifier && matches!(lower.as_str(), "p" | "g" | "u" | "j")) {
         event.prevent_default();
+    }
+    if modifier && lower == "k" {
+        event.prevent_default();
+        store.palette.set(Some(PaletteOrigin::Keyboard));
     }
     if modifier && lower == "o" {
         event.prevent_default();
@@ -77,10 +83,15 @@ fn on_key(store: Store, event: &web_sys::KeyboardEvent) {
     }
     if !modifier && !event.alt_key() {
         match key.as_str() {
-            "v" | "Escape" => store.tool.set(Tool::Select),
+            "v" | "Escape" => {
+                store.tool.set(Tool::Select);
+                store.selection.update(std::collections::BTreeSet::clear);
+            }
             "h" => store.tool.set(Tool::Highlight),
             "d" => store.tool.set(Tool::Pen),
             "t" => store.tool.set(Tool::Text),
+            "s" if store.doc.read_untracked().is_some() => store.start_signing(),
+            "r" if store.doc.read_untracked().is_some() => store.tool.set(Tool::Redact),
             "?" => store.help.set(true),
             _ => {}
         }
@@ -173,11 +184,23 @@ fn wire_shell(store: Store) {
         }
     });
     bridge::listen("file-opened", move |file: StagedFile| store.load_file(file));
+    bridge::listen("tool-progress", move |progress: ToolProgress| {
+        store.progress.set(Some(progress));
+    });
+    // Edits that reach disk are safe, so the question only appears when they cannot.
     bridge::listen("confirm-discard", move |id: String| {
-        store.discard_id.set(Some(id))
+        spawn_local(async move {
+            if store.persist().await {
+                bridge::answer_discard(id, true);
+            } else {
+                store.discard_id.set(Some(id));
+            }
+        });
     });
     bridge::listen("file-error", move |error: String| store.notify(error, true));
-    bridge::listen("file-dropped", move |path: String| store.open_dropped(path));
+    bridge::listen("file-dropped", move |paths: Vec<String>| {
+        store.receive_drop(paths)
+    });
     bridge::app_ready();
 }
 
@@ -196,7 +219,18 @@ fn Reader(
             <div class="document-scroll" node_ref=store.scroll on:scroll=move |_| store.track_page()>
                 <div class="document-pages">
                     <For
-                        each=move || pages.get().into_iter().map(|entry| entry.source)
+                        each={
+                            let count = infos.len() as u32;
+                            // Page lists and documents swap one signal apart; only ever
+                            // draw pages this document has.
+                            move || {
+                                pages
+                                    .get()
+                                    .into_iter()
+                                    .map(|entry| entry.source)
+                                    .filter(move |source| *source <= count)
+                            }
+                        }
                         key=|source| *source
                         children=move |source| {
                             let info = infos[source as usize - 1];
@@ -237,6 +271,9 @@ fn Reader(
                     </div>
                 </div>
             </div>
+            <Show when=move || store.scanned.get()>
+                <ScanHint />
+            </Show>
             <FloatingTools />
             <ReaderStatus />
         </main>
@@ -287,15 +324,34 @@ pub fn App() -> impl IntoView {
         }
     });
     Effect::new(move |_| bridge::set_dirty(store.dirty()));
+    Effect::new(move |_| {
+        if !store.dirty() {
+            return;
+        }
+        let write = move || {
+            spawn_local(async move {
+                store.persist().await;
+            });
+        };
+        if let Ok(timer) = set_timeout_with_handle(write, Duration::from_millis(AUTOSAVE_DELAY_MS))
+        {
+            on_cleanup(move || timer.clear());
+        }
+    });
     Effect::new(move |_| store.page_input.set(store.page.get().to_string()));
     Effect::new(move |_| {
-        if store
-            .toast
-            .read()
-            .as_ref()
-            .is_some_and(|toast| !toast.error)
-            && let Ok(timer) =
-                set_timeout_with_handle(move || store.toast.set(None), Duration::from_millis(3800))
+        // A toast with actions has to stay long enough to reach them.
+        let linger = store.toast.with(|toast| match toast {
+            Some(toast) if toast.error => None,
+            Some(toast) if toast.result.is_some() => Some(8000),
+            Some(_) => Some(3800),
+            None => None,
+        });
+        if let Some(linger) = linger
+            && let Ok(timer) = set_timeout_with_handle(
+                move || store.toast.set(None),
+                Duration::from_millis(linger),
+            )
         {
             on_cleanup(move || timer.clear());
         }
@@ -394,6 +450,25 @@ pub fn App() -> impl IntoView {
                                 }}
                                 <span>{toast.text}</span>
                                 {toast
+                                    .result
+                                    .map(|result| {
+                                        let (open, find) = (result.path.clone(), result.path);
+                                        view! {
+                                            <button
+                                                class="text-button"
+                                                on:click=move |_| store.open_result(open.clone())
+                                            >
+                                                "Open"
+                                            </button>
+                                            <button
+                                                class="text-button"
+                                                on:click=move |_| bridge::reveal_output(&find, false)
+                                            >
+                                                "Show in folder"
+                                            </button>
+                                        }
+                                    })}
+                                {toast
                                     .undoable
                                     .then(|| {
                                         view! {
@@ -424,7 +499,7 @@ pub fn App() -> impl IntoView {
             <Show when=move || store.dragging.get()>
                 <div class="drop-overlay">
                     <div>
-                        <Icon data=icons::FILE_PLUS_2 size=38 stroke_width=1.25 />
+                        <Icon data=icons::FILE_PLUS_CORNER size=38 stroke_width=1.25 />
                         <h2>"Make room for a new idea."</h2>
                         <p>"Drop your PDF to open it in ethos."</p>
                     </div>
@@ -442,6 +517,15 @@ pub fn App() -> impl IntoView {
             <Show when=move || store.discard_id.read().is_some()>
                 <DiscardDialog />
             </Show>
+            <Show when=move || store.tool_busy.get()>
+                <ToolStatus />
+            </Show>
+            <Sheets />
+            {move || {
+                store.palette.get().map(|origin| {
+                    view! { <Palette anchored=origin == PaletteOrigin::Toolbar /> }
+                })
+            }}
             <Tooltips />
         </div>
     }

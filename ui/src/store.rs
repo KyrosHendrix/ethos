@@ -1,10 +1,13 @@
 //! Application state and the actions that change it.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ethos_core::{
-    Edits, InkColor, LoadOutcome, Mark, MarkKind, NOTE_LINE_HEIGHT, PageEntry, PageInfo, Point,
-    RecentFile, SaveOutcome, SearchHit, StagedFile, display_rotation, wrap_text_note,
+    Change, Edits, FieldValue, FormField, InkColor, LoadOutcome, Mark, MarkKind, NOTE_LINE_HEIGHT,
+    PageEntry, PageInfo, Point, RecentFile, Rect, SaveOutcome, SearchHit, StagedFile, ToolOutcome,
+    ToolProgress, ToolRequest, ToolResult, display_rotation, wrap_text_note,
 };
 use leptos::html;
 use leptos::prelude::*;
@@ -22,6 +25,8 @@ pub enum Tool {
     Highlight,
     Pen,
     Text,
+    Sign,
+    Redact,
 }
 
 impl Tool {
@@ -31,6 +36,8 @@ impl Tool {
             Self::Highlight => "tool-highlight",
             Self::Pen => "tool-pen",
             Self::Text => "tool-text",
+            Self::Sign => "tool-sign",
+            Self::Redact => "tool-redact",
         }
     }
 
@@ -40,6 +47,8 @@ impl Tool {
             Self::Highlight => "Highlight",
             Self::Pen => "Draw",
             Self::Text => "Add text",
+            Self::Sign => "Sign",
+            Self::Redact => "Redact",
         }
     }
 
@@ -49,6 +58,10 @@ impl Tool {
             Self::Highlight => "Select a passage to highlight it",
             Self::Pen => "Draw directly on the page",
             Self::Text => "Click the page to place a text note",
+            Self::Sign => "Click the page to place your signature, then drag it into position",
+            Self::Redact => {
+                "Drag over anything to remove it. It is gone for good in the copy you save"
+            }
         }
     }
 }
@@ -58,6 +71,7 @@ pub enum Tab {
     Pages,
     Notes,
     Search,
+    Changes,
 }
 
 impl Tab {
@@ -68,6 +82,7 @@ impl Tab {
             Self::Pages => "document-tab-pages",
             Self::Notes => "document-tab-notes",
             Self::Search => "document-tab-search",
+            Self::Changes => "document-tab-changes",
         }
     }
 
@@ -76,6 +91,7 @@ impl Tab {
             Self::Pages => "Pages",
             Self::Notes => "Notes",
             Self::Search => "Search",
+            Self::Changes => "Changes",
         }
     }
 }
@@ -103,6 +119,14 @@ pub struct Document {
 }
 
 impl Document {
+    /// The file name without its `.pdf` ending.
+    pub fn title(&self) -> String {
+        let end = self.name.len().checked_sub(4).filter(|&end| {
+            self.name.is_char_boundary(end) && self.name[end..].eq_ignore_ascii_case(".pdf")
+        });
+        end.map_or_else(|| self.name.clone(), |end| self.name[..end].to_owned())
+    }
+
     pub fn info(&self, source: u32) -> Option<PageInfo> {
         self.pages.get(source as usize - 1).copied()
     }
@@ -130,7 +154,79 @@ pub struct Toast {
     pub text: String,
     pub error: bool,
     pub undoable: bool,
+    /// A finished tool's file, offered to open or find.
+    pub result: Option<ToolResult>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilesKind {
+    Pdfs,
+    Pictures,
+}
+
+impl FilesKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pdfs => "pdfs",
+            Self::Pictures => "pictures",
+        }
+    }
+}
+
+/// A short form a tool needs before it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sheet {
+    Notes,
+    Split,
+    Extract,
+    Pictures,
+    Protect,
+    Signature,
+    Files(FilesKind, Vec<PathBuf>),
+}
+
+/// How the tools list was summoned, which decides where it appears and whether it animates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteOrigin {
+    Keyboard,
+    Toolbar,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Comparison {
+    pub name: String,
+    pub changes: Vec<Change>,
+}
+
+/// Parses a page list such as `1-3, 5` into page numbers, or `None` if it does not fit.
+pub fn parse_page_list(text: &str, count: u32) -> Option<Vec<u32>> {
+    let mut pages = Vec::new();
+    for part in text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
+        let start = if start.trim().is_empty() {
+            1
+        } else {
+            start.trim().parse().ok()?
+        };
+        let end = if end.trim().is_empty() {
+            count
+        } else {
+            end.trim().parse().ok()?
+        };
+        if start == 0 || end > count || start > end {
+            return None;
+        }
+        pages.extend(start..=end);
+    }
+    (!pages.is_empty()).then_some(pages)
+}
+
+const SIGNATURE_KEY: &str = "ethos-signature";
+const SIGNATURE_WIDTH: f64 = 170.0;
 
 #[derive(Clone)]
 pub struct NoteDraft {
@@ -153,6 +249,28 @@ fn stored_theme() -> Option<String> {
         .ok()
         .flatten()
         .and_then(|storage| storage.get_item("ethos-theme").ok().flatten())
+}
+
+fn stored_signature() -> Option<Vec<Vec<Point>>> {
+    let storage = window().local_storage().ok().flatten()?;
+    let text = storage.get_item(SIGNATURE_KEY).ok().flatten()?;
+    let strokes: Vec<Vec<(f64, f64)>> = text
+        .split(';')
+        .map(|stroke| {
+            stroke
+                .split(' ')
+                .filter_map(|pair| {
+                    let (x, y) = pair.split_once(',')?;
+                    Some((x.parse().ok()?, y.parse().ok()?))
+                })
+                .collect()
+        })
+        .collect();
+    let strokes: Vec<Vec<Point>> = strokes
+        .into_iter()
+        .map(|stroke| stroke.into_iter().map(|(x, y)| Point { x, y }).collect())
+        .collect();
+    (!strokes.is_empty()).then_some(strokes)
 }
 
 fn random_id() -> String {
@@ -190,6 +308,19 @@ pub struct Store {
     pub discard_id: RwSignal<Option<String>>,
     pub dark: RwSignal<bool>,
     pub dragging: RwSignal<bool>,
+    pub fields: RwSignal<Vec<FormField>>,
+    pub protected: RwSignal<bool>,
+    /// Source pages selected in the sidebar.
+    pub selection: RwSignal<BTreeSet<u32>>,
+    pub selection_anchor: StoredValue<Option<u32>>,
+    pub sheet: RwSignal<Option<Sheet>>,
+    pub palette: RwSignal<Option<PaletteOrigin>>,
+    pub tool_busy: RwSignal<bool>,
+    pub progress: RwSignal<Option<ToolProgress>>,
+    pub changes: RwSignal<Option<Comparison>>,
+    pub scanned: RwSignal<bool>,
+    pub scan_dismissed: StoredValue<bool>,
+    pub signature: RwSignal<Option<Vec<Vec<Point>>>>,
     pub scroll: NodeRef<html::Div>,
     pub search_input: NodeRef<html::Input>,
     load_sequence: StoredValue<u64>,
@@ -228,6 +359,18 @@ impl Store {
             discard_id: RwSignal::new(None),
             dark: RwSignal::new(stored_theme().is_some_and(|theme| theme == "dark")),
             dragging: RwSignal::new(false),
+            fields: RwSignal::new(Vec::new()),
+            protected: RwSignal::new(false),
+            selection: RwSignal::new(BTreeSet::new()),
+            selection_anchor: StoredValue::new(None),
+            sheet: RwSignal::new(None),
+            palette: RwSignal::new(None),
+            tool_busy: RwSignal::new(false),
+            progress: RwSignal::new(None),
+            changes: RwSignal::new(None),
+            scanned: RwSignal::new(false),
+            scan_dismissed: StoredValue::new(false),
+            signature: RwSignal::new(stored_signature()),
             scroll: NodeRef::new(),
             search_input: NodeRef::new(),
             load_sequence: StoredValue::new(0),
@@ -266,6 +409,296 @@ impl Store {
             text: text.into(),
             error,
             undoable: false,
+            result: None,
+        }));
+    }
+
+    /// Runs a tool in the background; the reader stays usable while it works.
+    pub fn run_tool(self, request: ToolRequest) {
+        if self.tool_busy.get_untracked() {
+            self.notify("Another tool is still working.", false);
+            return;
+        }
+        let doc = self.doc.get_untracked();
+        let name = doc
+            .as_ref()
+            .map_or_else(String::new, |doc| doc.name.clone());
+        let edits = doc.is_some().then(|| {
+            self.history
+                .with_untracked(|history| Arc::clone(&history.present))
+        });
+        self.tool_busy.set(true);
+        spawn_local(async move {
+            let outcome = bridge::run_tool(&request, edits.as_deref(), &name).await;
+            self.tool_busy.set(false);
+            self.progress.set(None);
+            match outcome {
+                Ok(ToolOutcome::Done(result)) => self.toast.set(Some(Toast {
+                    text: result.label.clone(),
+                    error: false,
+                    undoable: false,
+                    result: Some(result),
+                })),
+                Ok(ToolOutcome::Compared { name, changes }) => {
+                    self.changes.set(Some(Comparison { name, changes }));
+                    self.sidebar.set(true);
+                    self.tab.set(Tab::Changes);
+                }
+                Ok(ToolOutcome::Cancelled) => {}
+                Err(error) => self.notify(error, true),
+            }
+        });
+    }
+
+    pub fn pick_files(self, kind: FilesKind) {
+        spawn_local(async move {
+            match bridge::pick_paths(kind.as_str()).await {
+                Ok(paths) if !paths.is_empty() => self.sheet.set(Some(Sheet::Files(kind, paths))),
+                Ok(_) => {}
+                Err(error) => self.notify(error, true),
+            }
+        });
+    }
+
+    pub fn open_result(self, path: String) {
+        self.toast.set(None);
+        if path.to_lowercase().ends_with(".pdf") {
+            let pick = async move { bridge::open_output(&path).await };
+            self.open_with(pick);
+        } else {
+            bridge::reveal_output(&path, true);
+        }
+    }
+
+    /// Asks for a signature the first time, and goes straight to placing it after that.
+    pub fn start_signing(self) {
+        if self.signature.read_untracked().is_some() {
+            self.tool.set(Tool::Sign);
+        } else {
+            self.sheet.set(Some(Sheet::Signature));
+        }
+    }
+
+    pub fn remember_signature(self, strokes: Vec<Vec<Point>>) {
+        let text = strokes
+            .iter()
+            .map(|stroke| {
+                let pairs: Vec<_> = stroke
+                    .iter()
+                    .map(|point| format!("{:.1},{:.1}", point.x, point.y))
+                    .collect();
+                pairs.join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        if let Ok(Some(storage)) = window().local_storage() {
+            // A profile that refuses storage only means drawing it again next time.
+            let _ = storage.set_item(SIGNATURE_KEY, &text);
+        }
+        self.signature.set(Some(strokes));
+    }
+
+    /// The saved signature with its middle at `center`, sized for the page.
+    pub fn signature_at(self, center: Point) -> Option<Vec<Vec<Point>>> {
+        let strokes = self.signature.read_untracked();
+        let strokes = strokes.as_ref()?;
+        let points = || strokes.iter().flatten();
+        let left = points().map(|point| point.x).fold(f64::MAX, f64::min);
+        let right = points().map(|point| point.x).fold(f64::MIN, f64::max);
+        let top = points().map(|point| point.y).fold(f64::MAX, f64::min);
+        let bottom = points().map(|point| point.y).fold(f64::MIN, f64::max);
+        let scale = SIGNATURE_WIDTH / (right - left).max(1.0);
+        let placed = strokes
+            .iter()
+            .map(|stroke| {
+                stroke
+                    .iter()
+                    .map(|point| Point {
+                        x: center.x + (point.x - (left + right) / 2.0) * scale,
+                        y: center.y - (point.y - (top + bottom) / 2.0) * scale,
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(placed)
+    }
+
+    /// Adds the saved signature with its middle at `center`, on page `source`.
+    pub fn place_signature(self, source: u32, center: Point) {
+        match self.signature_at(center) {
+            Some(strokes) => {
+                self.add_mark(self.new_mark(source, MarkKind::Signature { strokes }));
+                self.tool.set(Tool::Select);
+            }
+            None => self.sheet.set(Some(Sheet::Signature)),
+        }
+    }
+
+    /// Moves a placed signature, as one undo step.
+    pub fn move_signature(self, id: &str, by: Point) {
+        self.commit(|edits| {
+            let mut next = edits.clone();
+            for mark in next.marks.iter_mut().filter(|mark| mark.id == id) {
+                if let MarkKind::Signature { strokes } = &mut mark.kind {
+                    for point in strokes.iter_mut().flatten() {
+                        point.x += by.x;
+                        point.y += by.y;
+                    }
+                }
+            }
+            next
+        });
+    }
+
+    pub fn add_redaction(self, source: u32, rect: Rect) {
+        self.add_mark(self.new_mark(source, MarkKind::Redaction { rect }));
+    }
+
+    pub fn field_value(self, field: &FormField) -> String {
+        self.history.with(|history| {
+            history
+                .present
+                .fields
+                .iter()
+                .find(|value| value.name == field.name)
+                .map_or_else(|| field.value.clone(), |value| value.value.clone())
+        })
+    }
+
+    pub fn set_field(self, name: String, value: String) {
+        self.commit(|edits| {
+            let mut next = edits.clone();
+            next.fields.retain(|field| field.name != name);
+            next.fields.push(FieldValue { name, value });
+            next
+        });
+    }
+
+    pub fn focus_first_field(self) {
+        let Some(first) = self.fields.read_untracked().first().map(|field| field.page) else {
+            return;
+        };
+        self.source_navigate(first);
+        request_animation_frame(move || {
+            if let Ok(Some(field)) = document()
+                .query_selector(".form-field input, .form-field textarea, .form-field select")
+                && let Ok(field) = wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(field)
+            {
+                let _ = field.focus();
+            }
+        });
+    }
+
+    /// A click selects one page, Ctrl adds or removes, and Shift extends from the last click.
+    pub fn select_page(self, source: u32, adding: bool, extending: bool) {
+        let pages = self.edits().pages.clone();
+        let position = |page: u32| pages.iter().position(|entry| entry.source == page);
+        self.selection.update(|selection| {
+            let anchor = self.selection_anchor.get_value();
+            match (extending, anchor.and_then(position), position(source)) {
+                (true, Some(from), Some(to)) => {
+                    let (low, high) = (from.min(to), from.max(to));
+                    selection.clear();
+                    selection.extend(pages[low..=high].iter().map(|entry| entry.source));
+                }
+                _ if adding => {
+                    if !selection.remove(&source) {
+                        selection.insert(source);
+                    }
+                }
+                _ => selection.clear(),
+            }
+        });
+        if !extending {
+            self.selection_anchor.set_value(Some(source));
+        }
+    }
+
+    /// Moves a page, or the whole selection it belongs to, so it sits at `index`.
+    pub fn move_pages(self, source: u32, index: usize) {
+        let selection = self.selection.get_untracked();
+        let moving = if selection.contains(&source) {
+            selection
+        } else {
+            BTreeSet::from([source])
+        };
+        self.commit(|edits| {
+            let mut next = edits.clone();
+            let before = edits.pages[..index.min(edits.pages.len())]
+                .iter()
+                .filter(|entry| moving.contains(&entry.source))
+                .count();
+            let (moved, mut rest): (Vec<_>, Vec<_>) = edits
+                .pages
+                .iter()
+                .copied()
+                .partition(|entry| moving.contains(&entry.source));
+            let at = index.saturating_sub(before).min(rest.len());
+            rest.splice(at..at, moved);
+            next.pages = rest;
+            next
+        });
+    }
+
+    pub fn selected_numbers(self) -> Vec<u32> {
+        let selection = self.selection.get_untracked();
+        let edits = self.edits();
+        edits
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| selection.contains(&entry.source))
+            .map(|(index, _)| index as u32 + 1)
+            .collect()
+    }
+
+    pub fn rotate_selection(self) {
+        let Some(doc) = self.doc.get_untracked() else {
+            return;
+        };
+        let selection = self.selection.get_untracked();
+        self.commit(|edits| {
+            let mut next = edits.clone();
+            for entry in next
+                .pages
+                .iter_mut()
+                .filter(|entry| selection.contains(&entry.source))
+            {
+                if let Some(info) = doc.info(entry.source) {
+                    entry.rotation = Some((display_rotation(*entry, info) + 90) % 360);
+                }
+            }
+            next
+        });
+    }
+
+    pub fn delete_selection(self) {
+        let selection = self.selection.get_untracked();
+        let remaining = self.history.with_untracked(|history| {
+            history
+                .present
+                .pages
+                .iter()
+                .filter(|entry| !selection.contains(&entry.source))
+                .count()
+        });
+        if remaining == 0 {
+            self.notify("A document needs at least one page.", false);
+            return;
+        }
+        self.commit(|edits| {
+            let mut next = edits.clone();
+            next.pages
+                .retain(|entry| !selection.contains(&entry.source));
+            next
+        });
+        self.selection.update(BTreeSet::clear);
+        self.page.update(|page| *page = (*page).min(remaining));
+        self.toast.set(Some(Toast {
+            text: "Pages removed.".into(),
+            error: false,
+            undoable: true,
+            result: None,
         }));
     }
 
@@ -338,7 +771,17 @@ impl Store {
             // shortcut: a stale parse still replaces the engine's document, so if a newer
             // file then fails to load the old document's pages stop rendering. The window
             // is one open racing another, which only external opens can trigger.
-            Ok(LoadOutcome::Ready { pages }) if current() => self.install(file, pages).await,
+            Ok(LoadOutcome::Ready {
+                pages,
+                marks,
+                restored,
+                fields,
+                protected,
+            }) if current() => {
+                self.fields.set(fields);
+                self.protected.set(protected);
+                self.install(file, pages, marks, restored).await;
+            }
             Ok(LoadOutcome::Password { incorrect }) if current() => {
                 self.password.set(Some(PasswordPrompt {
                     file,
@@ -356,7 +799,13 @@ impl Store {
         }
     }
 
-    async fn install(self, file: StagedFile, pages: Vec<PageInfo>) {
+    async fn install(
+        self,
+        file: StagedFile,
+        pages: Vec<PageInfo>,
+        marks: Vec<Mark>,
+        restored: Option<Edits>,
+    ) {
         let entries = (1..=pages.len() as u32)
             .map(|source| PageEntry {
                 source,
@@ -364,11 +813,27 @@ impl Store {
             })
             .collect();
         let initial = Arc::new(Edits {
-            marks: Vec::new(),
+            marks,
             pages: entries,
+            fields: Vec::new(),
         });
-        self.saved.set(Arc::clone(&initial));
-        self.history.set(History::fresh(initial));
+        self.selection.update(BTreeSet::clear);
+        self.changes.set(None);
+        self.scanned.set(false);
+        self.scan_dismissed.set_value(false);
+        let restored = restored.filter(|edits| *edits != *initial);
+        let came_back = restored.is_some();
+        let history = match restored {
+            // Undo stays available, so a deleted page is never out of reach.
+            Some(edits) => History {
+                past: vec![initial],
+                present: Arc::new(edits),
+                future: Vec::new(),
+            },
+            None => History::fresh(initial),
+        };
+        self.saved.set(Arc::clone(&history.present));
+        self.history.set(history);
         let title = format!("{} · ethos", file.name);
         self.doc.set(Some(Arc::new(Document {
             token: file.token,
@@ -390,6 +855,38 @@ impl Store {
         }
         if let Some(scroll) = self.scroll.get_untracked() {
             scroll.set_scroll_top(0);
+        }
+        if came_back {
+            self.toast.set(Some(Toast {
+                text: "Your marks are back.".into(),
+                error: false,
+                undoable: true,
+                result: None,
+            }));
+        }
+    }
+
+    /// Writes edits until the saved state is current. False means they are still at risk,
+    /// because the document keeps no session or the write failed.
+    pub async fn persist(self) -> bool {
+        loop {
+            let Some(doc) = self.doc.get_untracked() else {
+                return false;
+            };
+            let snapshot = self
+                .history
+                .with_untracked(|history| Arc::clone(&history.present));
+            match bridge::save_session(doc.token, &snapshot).await {
+                Ok(true) => {}
+                _ => return false,
+            }
+            let unchanged = self
+                .history
+                .with_untracked(|history| Arc::ptr_eq(&history.present, &snapshot));
+            if unchanged {
+                self.saved.set(snapshot);
+                return true;
+            }
         }
     }
 
@@ -457,6 +954,23 @@ impl Store {
         }
     }
 
+    /// One PDF opens. Several, or any pictures, go to the sheet that can use them together.
+    pub fn receive_drop(self, paths: Vec<String>) {
+        let is_pdf = |path: &String| path.to_lowercase().ends_with(".pdf");
+        match &paths[..] {
+            [only] if is_pdf(only) => self.open_dropped(only.clone()),
+            _ => {
+                let kind = if paths.iter().all(is_pdf) {
+                    FilesKind::Pdfs
+                } else {
+                    FilesKind::Pictures
+                };
+                let paths = paths.into_iter().map(PathBuf::from).collect();
+                self.sheet.set(Some(Sheet::Files(kind, paths)));
+            }
+        }
+    }
+
     pub fn open_dropped(self, path: String) {
         if !self.busy() {
             self.open_with(bridge::open_dropped(path));
@@ -491,6 +1005,10 @@ impl Store {
             self.saved.set(Arc::clone(&empty));
             self.history.set(History::fresh(empty));
             self.doc.set(None);
+            self.fields.set(Vec::new());
+            self.protected.set(false);
+            self.changes.set(None);
+            self.scanned.set(false);
             self.query.set(String::new());
             self.toast.set(None);
             bridge::set_dirty(false);
@@ -513,8 +1031,20 @@ impl Store {
         spawn_local(async move {
             match bridge::save_copy(&snapshot, &doc.name).await {
                 Ok(SaveOutcome::Saved) => {
+                    let redacted = snapshot
+                        .marks
+                        .iter()
+                        .filter(|mark| matches!(mark.kind, MarkKind::Redaction { .. }))
+                        .count();
                     self.saved.set(snapshot);
-                    self.notify("Copy saved. Your original is untouched.", false);
+                    self.notify(
+                        match redacted {
+                            0 => "Copy saved. Your original is untouched.".to_owned(),
+                            1 => "Copy saved, with 1 area removed for good.".to_owned(),
+                            count => format!("Copy saved, with {count} areas removed for good."),
+                        },
+                        false,
+                    );
                 }
                 Ok(SaveOutcome::Cancelled) => {}
                 Err(error) => self.notify(error, true),
@@ -595,6 +1125,7 @@ impl Store {
             text: "Page removed.".into(),
             error: false,
             undoable: true,
+            result: None,
         }));
     }
 

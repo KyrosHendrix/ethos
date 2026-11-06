@@ -3,6 +3,7 @@ name = "ethos"
 description = "A considered space for your documents"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 # Replaces native file dialogs with scripted answers for the end-to-end test.
@@ -17,6 +18,7 @@ ethos-core.workspace = true
 ethos-engine.workspace = true
 rusty-leveldb = "4.0.2"
 same-file = "1"
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }

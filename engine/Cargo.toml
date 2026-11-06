@@ -3,8 +3,23 @@ name = "ethos-engine"
 description = "PDF parsing, rendering, search and export for ethos"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ethos-core.workspace = true
+flate2 = "1"
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
 lopdf = { version = "0.40", default-features = false }
+roxmltree = "0.20"
+serde_json.workspace = true
+similar = "2"
+ttf-parser = "0.25"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Foundation_Collections", "Graphics_Imaging", "Media_Ocr", "Storage_Streams", "Win32_System_WinRT",
+] }
+windows-future = "0.3"

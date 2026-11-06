@@ -1,6 +1,11 @@
 //! Typed calls into the native shell.
 
-use ethos_core::{Edits, LoadOutcome, RecentFile, SaveOutcome, SearchHit, StagedFile, TextRun};
+use std::path::PathBuf;
+
+use ethos_core::{
+    Edits, LoadOutcome, RecentFile, SaveOutcome, SearchHit, StagedFile, TextRun, ToolOutcome,
+    ToolRequest,
+};
 use js_sys::{ArrayBuffer, Uint8ClampedArray};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,8 +21,8 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["__TAURI__", "event"], js_name = listen)]
     fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> js_sys::Promise;
 
-    #[wasm_bindgen(catch, js_namespace = ["chrome", "webview"], js_name = postMessageWithAdditionalObjects)]
-    fn post_with_objects(message: &str, objects: &web_sys::FileList) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch, js_namespace = ["__ETHOS__"], js_name = postDroppedFiles)]
+    fn post_with_objects(objects: &web_sys::FileList) -> Result<(), JsValue>;
 }
 
 fn encode(value: &impl Serialize) -> Result<JsValue, String> {
@@ -74,8 +79,7 @@ pub async fn open_dropped(path: String) -> Result<Option<StagedFile>, String> {
 
 /// Hands dropped files to the shell, which answers with a `file-dropped` event.
 pub fn post_dropped_files(files: &web_sys::FileList) -> Result<(), String> {
-    post_with_objects("ethos-dropped-files", files)
-        .map_err(|_| "Could not open this PDF.".to_owned())
+    post_with_objects(files).map_err(|_| "Could not open this PDF.".to_owned())
 }
 
 pub async fn saved_theme() -> Option<String> {
@@ -96,6 +100,42 @@ pub async fn load_document(token: u64, password: Option<String>) -> Result<LoadO
         json!({ "token": token, "password": password }),
     )
     .await
+}
+
+/// Records edits for the open document. `false` means it does not keep any.
+pub async fn save_session(token: u64, edits: &Edits) -> Result<bool, String> {
+    let edits = serde_json::to_value(edits).map_err(|error| error.to_string())?;
+    call("save_session", json!({ "token": token, "edits": edits })).await
+}
+
+pub async fn run_tool(
+    request: &ToolRequest,
+    edits: Option<&Edits>,
+    name: &str,
+) -> Result<ToolOutcome, String> {
+    let request = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let edits = serde_json::to_value(edits).map_err(|error| error.to_string())?;
+    call(
+        "run_tool",
+        json!({ "request": request, "edits": edits, "name": name }),
+    )
+    .await
+}
+
+pub fn cancel_tool() {
+    notify_shell("cancel_tool", json!({}));
+}
+
+pub async fn pick_paths(kind: &str) -> Result<Vec<PathBuf>, String> {
+    call("pick_paths", json!({ "kind": kind })).await
+}
+
+pub async fn open_output(path: &str) -> Result<Option<StagedFile>, String> {
+    call("open_output", json!({ "path": path })).await
+}
+
+pub fn reveal_output(path: &str, open: bool) {
+    notify_shell("reveal_output", json!({ "path": path, "open": open }));
 }
 
 pub fn cancel_load() {

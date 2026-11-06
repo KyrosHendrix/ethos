@@ -2,10 +2,12 @@
 
 mod geometry;
 mod helvetica;
+mod notes;
 mod search;
 
 pub use geometry::{RunLayout, Viewport, display_rotation};
-pub use helvetica::{encode_win_ansi, wrap_text_note};
+pub use helvetica::{encode_win_ansi, note_width, wrap_text_note};
+pub use notes::notes_markdown;
 pub use search::find_hit;
 
 use serde::{Deserialize, Serialize};
@@ -76,9 +78,25 @@ pub struct Rect {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MarkKind {
-    Highlight { rects: Vec<Rect>, text: String },
-    Pen { points: Vec<Point> },
-    Text { point: Point, text: String },
+    Highlight {
+        rects: Vec<Rect>,
+        text: String,
+    },
+    Pen {
+        points: Vec<Point>,
+    },
+    Text {
+        point: Point,
+        text: String,
+    },
+    /// A drawn signature; each stroke is a run of points on the page.
+    Signature {
+        strokes: Vec<Vec<Point>>,
+    },
+    /// An area to remove for good when a copy is saved.
+    Redaction {
+        rect: Rect,
+    },
 }
 
 /// An annotation, addressed by its source page so it survives page deletion and undo.
@@ -98,10 +116,125 @@ pub struct PageEntry {
     pub rotation: Option<u16>,
 }
 
+/// A value typed into a form field, by the field's full name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FieldKind {
+    Text { multiline: bool },
+    Check { on: String },
+    Radio { on: String },
+    Choice { options: Vec<String> },
+}
+
+/// One fillable widget on a page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FormField {
+    pub name: String,
+    pub kind: FieldKind,
+    pub page: u32,
+    pub rect: Rect,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// One difference between the open document and a version it was compared with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    pub kind: ChangeKind,
+    /// The page of the open document this change is on or nearest to.
+    pub page: u32,
+    pub before: String,
+    pub after: String,
+    /// Where it is on that page. Empty for text that is no longer there.
+    pub rects: Vec<Rect>,
+}
+
+/// A tool the interface asks the shell to run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tool", rename_all = "camelCase")]
+pub enum ToolRequest {
+    SaveText {
+        suggested: String,
+        text: String,
+        kind: String,
+    },
+    Markdown,
+    Text,
+    Word,
+    Images {
+        jpeg: bool,
+        dpi: u32,
+    },
+    Extract {
+        pages: Vec<u32>,
+    },
+    Split {
+        ranges: String,
+        every: Option<u32>,
+    },
+    Merge {
+        paths: Vec<std::path::PathBuf>,
+        include_current: bool,
+    },
+    ImagesToPdf {
+        paths: Vec<std::path::PathBuf>,
+        fit_a4: bool,
+    },
+    WordToPdf {
+        path: Option<std::path::PathBuf>,
+    },
+    Searchable,
+    Smaller,
+    Protect {
+        password: String,
+    },
+    RemovePassword,
+    Compare {
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub path: String,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum ToolOutcome {
+    Done(ToolResult),
+    Compared { name: String, changes: Vec<Change> },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolProgress {
+    pub label: String,
+    pub done: u32,
+    pub total: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Edits {
     pub marks: Vec<Mark>,
     pub pages: Vec<PageEntry>,
+    #[serde(default)]
+    pub fields: Vec<FieldValue>,
 }
 
 /// Page geometry as stored in the PDF: `view` is `[left, bottom, right, top]`.
@@ -122,8 +255,20 @@ pub struct StagedFile {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum LoadOutcome {
-    Ready { pages: Vec<PageInfo> },
-    Password { incorrect: bool },
+    Ready {
+        pages: Vec<PageInfo>,
+        /// Marks a saved copy carries, which become the document's starting state.
+        marks: Vec<Mark>,
+        /// Edits saved automatically the last time this exact file was open.
+        restored: Option<Edits>,
+        /// Form fields a person can fill in.
+        fields: Vec<FormField>,
+        /// Whether a password opened this document.
+        protected: bool,
+    },
+    Password {
+        incorrect: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

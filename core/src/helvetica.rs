@@ -59,7 +59,8 @@ pub fn encode_win_ansi(text: &str) -> Option<Vec<u8>> {
     text.chars().map(win_ansi).collect()
 }
 
-fn width(text: &str) -> f64 {
+/// The width of `text` in points at the note font size.
+pub fn note_width(text: &str) -> f64 {
     let units: u32 = text
         .chars()
         .filter_map(win_ansi)
@@ -81,7 +82,7 @@ pub fn wrap_text_note(text: &str, max_width: f64) -> Result<String, String> {
         } else {
             format!("{line} {word}")
         };
-        if width(&candidate) <= max_width {
+        if note_width(&candidate) <= max_width {
             line = candidate;
             continue;
         }
@@ -91,7 +92,7 @@ pub fn wrap_text_note(text: &str, max_width: f64) -> Result<String, String> {
         for character in word.chars() {
             let mut grown = line.clone();
             grown.push(character);
-            if !line.is_empty() && width(&grown) > max_width {
+            if !line.is_empty() && note_width(&grown) > max_width {
                 lines.push(std::mem::take(&mut line));
                 line.push(character);
             } else {
@@ -120,7 +121,7 @@ mod tests {
         ] {
             let wrapped = wrap_text_note(text, 80.0).unwrap();
             assert_eq!(wrapped.replace(['\n', ' '], ""), text.replace(' ', ""));
-            assert!(wrapped.lines().all(|line| width(line) <= 80.0));
+            assert!(wrapped.lines().all(|line| note_width(line) <= 80.0));
         }
     }
 
@@ -142,6 +143,6 @@ mod tests {
 
     #[test]
     fn helvetica_metrics_match_the_core_font() {
-        assert_eq!(width("A"), 667.0 * 12.0 / 1000.0);
+        assert_eq!(note_width("A"), 667.0 * 12.0 / 1000.0);
     }
 }

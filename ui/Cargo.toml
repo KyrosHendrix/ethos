@@ -3,6 +3,7 @@ name = "ethos-ui"
 description = "The ethos interface, compiled to WebAssembly"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ethos-core.workspace = true
@@ -15,8 +16,8 @@ serde_json.workspace = true
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
-  "CanvasRenderingContext2d", "Crypto", "CssStyleDeclaration", "DataTransfer", "DomRect", "DomRectList", "DomStringList", "DragEvent", "FileList",
-  "Element", "HtmlCanvasElement", "HtmlElement", "ImageData", "IntersectionObserver", "IntersectionObserverEntry",
-  "IntersectionObserverInit", "KeyboardEvent", "Node", "NodeList", "PointerEvent", "Range", "ResizeObserver",
+  "CanvasRenderingContext2d", "Clipboard", "console", "Crypto", "CssStyleDeclaration", "DataTransfer", "DomRect", "DomRectList", "DomStringList", "DragEvent", "FileList",
+  "Element", "HtmlCanvasElement", "HtmlElement", "HtmlInputElement", "ImageData", "IntersectionObserver", "IntersectionObserverEntry",
+  "IntersectionObserverInit", "KeyboardEvent", "Node", "NodeList", "Navigator", "PointerEvent", "Range", "ResizeObserver",
   "ResizeObserverEntry", "ScrollBehavior", "ScrollIntoViewOptions", "ScrollLogicalPosition", "Selection", "Storage", "TextMetrics", "Window",
 ] }

@@ -15,6 +15,15 @@ use crate::icons;
 
 const FOCUSABLE: &str = "button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),[tabindex]:not([tabindex='-1'])";
 
+/// The drawing inside an `.svg` file, without its outer tag or license comment.
+fn icon_body(file: &str) -> &str {
+    let inner = file.find("<svg").and_then(|start| {
+        let open = start + file[start..].find('>')? + 1;
+        Some(&file[open..file.rfind("</svg>")?])
+    });
+    inner.unwrap_or_default()
+}
+
 #[component]
 pub fn Icon(
     data: &'static str,
@@ -35,7 +44,7 @@ pub fn Icon(
             stroke-linejoin="round"
             class=class
             aria-hidden="true"
-            inner_html=data
+            inner_html=icon_body(data)
         ></svg>
     }
 }
@@ -73,14 +82,15 @@ pub fn IconButton(
     }
 }
 
-/// Focuses the first `autofocus` element, or else the first focusable one.
+/// Focuses the `autofocus` element, or else the dialog itself, so Tab starts inside it
+/// without drawing a focus ring around the close button.
 fn focus_initial(content: &Element) {
     let target = content
         .query_selector("[autofocus]")
         .ok()
         .flatten()
-        .or_else(|| content.query_selector(FOCUSABLE).ok().flatten());
-    if let Some(target) = target.and_then(|node| node.dyn_into::<HtmlElement>().ok()) {
+        .unwrap_or_else(|| content.clone());
+    if let Ok(target) = target.dyn_into::<HtmlElement>() {
         // Focus can only fail on detached elements, and this one was just mounted.
         let _ = target.focus();
     }
@@ -131,7 +141,9 @@ pub fn Modal(
     );
     let heading_id = title_id.clone();
     let previous = SendWrapper::new(document().active_element());
-    content.on_load(|node| focus_initial(&node));
+    // A dialog can open during a pointer press, and that press's own default action would
+    // take focus straight back out, so focus lands on the next frame.
+    content.on_load(|node| request_animation_frame(move || focus_initial(&node)));
     let keys = window_event_listener(ev::keydown, move |event| match event.key().as_str() {
         "Escape" => {
             event.prevent_default();

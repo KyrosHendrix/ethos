@@ -7,10 +7,10 @@ use crate::bridge;
 use crate::controls::{Icon, IconButton, Modal, Select};
 use crate::icons;
 use crate::sidebar::ThemeButton;
-use crate::store::{NOTE_LIMIT, Store, Tool, Zoom};
+use crate::store::{NOTE_LIMIT, PaletteOrigin, Store, Tool, Zoom};
 
 const ZOOM_STEPS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-const SHORTCUTS: [(&str, &str); 10] = [
+const SHORTCUTS: [(&str, &str); 13] = [
     ("Open PDF", "Ctrl O"),
     ("Save a copy", "Ctrl S"),
     ("Search document", "Ctrl F"),
@@ -20,6 +20,9 @@ const SHORTCUTS: [(&str, &str); 10] = [
     ("Highlight", "H"),
     ("Draw", "D"),
     ("Add text", "T"),
+    ("Sign", "S"),
+    ("Redact", "R"),
+    ("Find a tool", "Ctrl K"),
     ("Return to selection", "Esc"),
 ];
 
@@ -31,14 +34,7 @@ fn percent(scale: f64) -> String {
 pub fn TitleBar() -> impl IntoView {
     let store = expect_context::<Store>();
     let sidebar = store.sidebar;
-    let name = move || {
-        store.doc.read().as_ref().map(|doc| {
-            let stem = doc.name.len().checked_sub(4).filter(|&end| {
-                doc.name.is_char_boundary(end) && doc.name[end..].eq_ignore_ascii_case(".pdf")
-            });
-            stem.map_or_else(|| doc.name.clone(), |end| doc.name[..end].to_owned())
-        })
-    };
+    let name = move || store.doc.read().as_ref().map(|doc| doc.title());
     let busy = move || store.saving.get() || store.loading.get();
     view! {
         <header class="titlebar" data-tauri-drag-region>
@@ -61,6 +57,12 @@ pub fn TitleBar() -> impl IntoView {
                     </Show>
                 </div>
                 <div class="titlebar-actions" data-tauri-drag-region>
+                    <IconButton
+                        label="Tools (Ctrl K)"
+                        on_click=move || store.palette.set(Some(PaletteOrigin::Toolbar))
+                    >
+                        <Icon data=icons::WRENCH size=15 />
+                    </IconButton>
                     <ThemeButton />
                     <button
                         class="primary-button save-button"
@@ -107,6 +109,10 @@ pub fn FloatingTools() -> impl IntoView {
         (Tool::Pen, icons::PEN_LINE, "D"),
         (Tool::Text, icons::TYPE, "T"),
     ];
+    let finishing = [
+        (Tool::Sign, icons::SIGNATURE, "S"),
+        (Tool::Redact, icons::RECTANGLE_HORIZONTAL, "R"),
+    ];
     view! {
         <div class="floating-tools" role="toolbar" aria-label="Annotation tools">
             <div class="tool-group">
@@ -117,6 +123,29 @@ pub fn FloatingTools() -> impl IntoView {
                                 label=format!("{} ({shortcut})", tool.name())
                                 active=Signal::derive(move || store.tool.get() == tool)
                                 on_click=move || store.tool.set(tool)
+                            >
+                                <Icon data=data size=18 stroke_width=1.7 />
+                            </IconButton>
+                        }
+                    })
+                    .into_iter()
+                    .collect_view()}
+            </div>
+            <span class="toolbar-divider"></span>
+            <div class="tool-group">
+                {finishing
+                    .map(|(tool, data, shortcut)| {
+                        view! {
+                            <IconButton
+                                label=format!("{} ({shortcut})", tool.name())
+                                active=Signal::derive(move || store.tool.get() == tool)
+                                on_click=move || {
+                                    if tool == Tool::Sign {
+                                        store.start_signing();
+                                    } else {
+                                        store.tool.set(tool);
+                                    }
+                                }
                             >
                                 <Icon data=data size=18 stroke_width=1.7 />
                             </IconButton>
@@ -236,7 +265,7 @@ pub fn ReaderStatus() -> impl IntoView {
                     disabled=Signal::derive(move || count.get() <= 1)
                     on_click=move || store.delete_page()
                 >
-                    <Icon data=icons::TRASH_2 size=14 />
+                    <Icon data=icons::TRASH size=14 />
                 </IconButton>
                 <span class="toolbar-divider"></span>
                 <IconButton
