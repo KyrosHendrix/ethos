@@ -250,6 +250,8 @@ fn value_holder(document: &Document, widget: ObjectId) -> ObjectId {
 }
 
 /// Unlinks fields from pages rebuilt by redaction, including shared widgets and empty groups.
+/// Refuses inherited values on retained ancestors before mutating the document: their
+/// appearances, rich text, and choice data may contain copies that cannot be safely separated.
 pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Result<(), String> {
     if pages.is_empty() {
         return Ok(());
@@ -291,7 +293,7 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
                             let Some(id) = parent else { break };
                             let node = document.get_dictionary(id).map_err(describe)?;
                             if node.has(key) {
-                                inherited_values.insert((id, key));
+                                inherited_values.insert(id);
                             }
                             parent = node.get(b"Parent").and_then(Object::as_reference).ok();
                         }
@@ -305,14 +307,6 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
     }
     if removed.is_empty() {
         return Ok(());
-    }
-    for (id, key) in inherited_values {
-        let node = document
-            .get_object_mut(id)
-            .and_then(Object::as_dict_mut)
-            .map_err(describe)?;
-        node.remove(key);
-        node.remove(b"AP");
     }
     loop {
         let before = removed.len();
@@ -344,6 +338,9 @@ pub(crate) fn remove_page_fields(document: &mut Document, pages: &[u32]) -> Resu
         if removed.len() == before {
             break;
         }
+    }
+    if inherited_values.iter().any(|id| !removed.contains(id)) {
+        return Err("Redaction cannot safely separate shared inherited values from retained form fields. Nothing was saved.".into());
     }
     let mut updates = Vec::new();
     for (&id, object) in &document.objects {
@@ -790,10 +787,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn redaction_clears_inherited_values_but_keeps_unrelated_fields() {
+    fn redaction_rejects_shared_inherited_values_without_changing_fields() {
         let mut document = fixture_document();
         let pages = document.get_pages();
         let group = document.new_object_id();
+        let appearance = document.add_object(Stream::new(
+            Dictionary::new(),
+            b"BT (Secret) Tj ET".to_vec(),
+        ));
         let rect = vec![30.into(), 300.into(), 230.into(), 324.into()];
         let sensitive = document.add_object(dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "Parent" => group, "P" => pages[&1],
@@ -801,10 +802,12 @@ pub(crate) mod tests {
         });
         let retained = document.add_object(dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "Parent" => group, "P" => pages[&2],
-            "T" => Object::string_literal("retained"), "V" => Object::string_literal("Public"), "Rect" => rect,
+            "T" => Object::string_literal("retained"), "Rect" => rect,
+            "AP" => dictionary! { "N" => appearance },
         });
         document.objects.insert(group, dictionary! {
             "FT" => "Tx", "V" => Object::string_literal("Secret"), "DV" => Object::string_literal("Default secret"),
+            "RV" => Object::string_literal("<p>Secret</p>"), "Opt" => vec![Object::string_literal("Secret")],
             "Kids" => vec![sensitive.into(), retained.into()],
         }.into());
         document
@@ -823,18 +826,28 @@ pub(crate) mod tests {
             .catalog_mut()
             .unwrap()
             .set("AcroForm", dictionary! { "Fields" => vec![group.into()] });
-        remove_page_fields(&mut document, &[1]).unwrap();
+        for own_value in [None, Some("Public")] {
+            let mut candidate = document.clone();
+            if let Some(value) = own_value {
+                candidate
+                    .get_object_mut(retained)
+                    .unwrap()
+                    .as_dict_mut()
+                    .unwrap()
+                    .set("V", Object::string_literal(value));
+            }
+            let original = candidate.objects.clone();
+            let error = remove_page_fields(&mut candidate, &[1]).unwrap_err();
+            assert!(error.contains("shared inherited values"));
+            assert_eq!(candidate.objects, original);
+        }
+        remove_page_fields(&mut document, &[1, 2]).unwrap();
         document.prune_objects();
-        let bytes = serialize(&mut document).unwrap();
-        let saved = Document::load_mem(&bytes).unwrap();
-        let ancestor = saved.get_dictionary(group).unwrap();
-        assert!(!ancestor.has(b"V") && !ancestor.has(b"DV"));
-        let fields = read_fields(&bytes);
-        assert_eq!(fields.len(), 1);
-        assert_eq!(
-            (fields[0].name.as_str(), fields[0].value.as_str()),
-            ("retained", "Public")
-        );
+        let saved = Document::load_mem(&serialize(&mut document).unwrap()).unwrap();
+        assert!(!saved.catalog().unwrap().has(b"AcroForm"));
+        for id in [sensitive, retained, group, appearance] {
+            assert!(!saved.objects.contains_key(&id));
+        }
     }
 
     #[test]
