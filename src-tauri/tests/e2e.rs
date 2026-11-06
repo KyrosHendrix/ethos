@@ -921,15 +921,26 @@ fn form_pdf() -> Vec<u8> {
         "Rect" => rect(56, 240, 18, 18), "P" => first,
         "AP" => dictionary! { "N" => dictionary! { "Yes" => on, "Off" => off } },
     });
+    let choice = document.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Ch", "Ff" => 1_i64 << 17,
+        "T" => Object::string_literal("size"), "V" => Object::string_literal("S"),
+        "Rect" => rect(56, 200, 160, 26), "P" => first,
+        "Opt" => vec![
+            Object::Array(vec![Object::string_literal("S"), Object::string_literal("Small")]),
+            Object::Array(vec![Object::string_literal("L"), Object::string_literal("Large")]),
+            Object::Array(vec![Object::string_literal(""), Object::string_literal("No size")]),
+        ],
+    });
     document
         .get_object_mut(first)
         .and_then(Object::as_dict_mut)
         .unwrap()
-        .set("Annots", vec![text.into(), check.into()]);
-    let form = document.add_object(dictionary! { "Fields" => vec![text.into(), check.into()] });
+        .set("Annots", vec![text.into(), check.into(), choice.into()]);
+    let form = document
+        .add_object(dictionary! { "Fields" => vec![text.into(), check.into(), choice.into()] });
     document.catalog_mut().unwrap().set("AcroForm", form);
     let mut bytes = Vec::new();
-    document.save_to(&mut bytes).unwrap();
+    document.save_modern(&mut bytes).unwrap();
     bytes
 }
 
@@ -1186,6 +1197,34 @@ fn tools_produce_real_files() {
             .all(|mark| !matches!(mark.kind, MarkKind::Signature { .. })),
         "marks on a redacted page are burned in with it"
     );
+    let redacted_parts = folder.0.join("redacted-parts");
+    fs::create_dir_all(&redacted_parts).unwrap();
+    script_folder(&app, &redacted_parts);
+    run_from_palette(&mut app, "split");
+    app.fill("[role=dialog] input", "2");
+    app.click("Choose a folder");
+    app.wait_text("Split into 2 PDFs.");
+    dismiss_toast(&mut app);
+    let part = fs::read(redacted_parts.join("Report - part 1.pdf")).unwrap();
+    let part_document = Document::load_mem(&part).unwrap();
+    assert_eq!(part_document.get_pages().len(), 2);
+    assert!(pdf_text(&part).contains("Select a passage"));
+    assert!(
+        !pdf_text(&part).contains("The best tools"),
+        "split output bypassed redaction"
+    );
+    assert!(
+        part_document
+            .objects
+            .values()
+            .filter_map(|object| object.as_stream().ok())
+            .all(|stream| {
+                let content = stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                !content.windows(14).any(|part| part == b"The best tools")
+            })
+    );
     // Back to a clean document for the remaining tools.
     for _ in 0..3 {
         app.click("Undo (Ctrl Z)");
@@ -1347,6 +1386,26 @@ fn tools_produce_real_files() {
     app.press("Tab", 9, 0);
     app.eval("(document.activeElement.blur(), true)");
     app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    app.wait("document.querySelector('.form-field select')?.value === '0'");
+    assert_eq!(
+        app.eval("document.querySelector('.form-field select option[value=\"1\"]').textContent")
+            .as_str(),
+        Some("Large")
+    );
+    app.eval("(() => { const select = document.querySelector('.form-field select'); select.value = '2'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
+    app.wait("document.querySelector('.form-field select')?.selectedOptions[0]?.textContent === 'No size'");
+    app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    app.wait("document.querySelector('.form-field select')?.selectedOptions[0]?.textContent === 'No size'");
+    app.script_dialog("save-dialog.txt", &out("Empty choice.pdf"));
+    app.control('s');
+    app.wait_text("Copy saved");
+    assert_eq!(
+        read_fields(&fs::read(out("Empty choice.pdf")).unwrap())[2].value,
+        ""
+    );
+    dismiss_toast(&mut app);
+    app.eval("(document.querySelector('.form-field input[type=checkbox]').click(), true)");
+    app.eval("(() => { const select = document.querySelector('.form-field select'); select.value = '1'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
     sleep(Duration::from_millis(300));
     app.shot("form");
     app.script_dialog("save-dialog.txt", &out("Filled.pdf"));
@@ -1355,6 +1414,7 @@ fn tools_produce_real_files() {
     let fields = read_fields(&fs::read(out("Filled.pdf")).unwrap());
     assert_eq!(fields[0].value, "Grace Hopper");
     assert_eq!(fields[1].value, "Yes");
+    assert_eq!(fields[2].value, "L");
 
     println!("the new surfaces hold up in dark mode");
     app.eval("(named('Use dark appearance').click(), true)");

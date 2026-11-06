@@ -304,6 +304,7 @@ impl Worker<'_> {
         })
     }
 
+    /// Rejects stale document tokens and invalid one-based page numbers.
     fn page(&self, token: u64, source: u32) -> Result<PdfPage<'_>, String> {
         let (current, document) = self
             .document
@@ -311,7 +312,10 @@ impl Worker<'_> {
             .filter(|(current, _)| *current == token)
             .ok_or("This document is no longer open.")?;
         debug_assert_eq!(*current, token);
-        let index = i32::try_from(source - 1).map_err(|_| "Invalid page.".to_owned())?;
+        let index = source
+            .checked_sub(1)
+            .and_then(|index| i32::try_from(index).ok())
+            .ok_or_else(|| "Invalid page.".to_owned())?;
         document
             .pages()
             .get(index)
@@ -353,12 +357,16 @@ impl Worker<'_> {
             .join(" "))
     }
 
+    /// Searches only the current document, checking its token before any cache access.
     fn search(
         &mut self,
         token: u64,
         query: &str,
         sources: &[u32],
     ) -> Result<Vec<SearchHit>, String> {
+        if self.document.as_ref().map(|(current, _)| *current) != Some(token) {
+            return Err("This document is no longer open.".into());
+        }
         let mut hits = Vec::new();
         for &source in sources {
             let text = match self.text.get(source) {
@@ -638,6 +646,31 @@ pub(crate) mod tests {
         assert_eq!(page_text(&engine, 2, 1), "Original page 1");
         engine.close();
         assert!(engine.text_runs(2, 1).is_err());
+    }
+
+    #[test]
+    fn cached_search_rejects_stale_tokens_and_closed_documents() {
+        let engine = engine();
+        engine.load(1, create_sample().unwrap(), None).unwrap();
+        engine.load(2, fixture(), None).unwrap();
+        assert!(
+            !engine
+                .search(2, "Original".into(), vec![1])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(engine.search(1, "Original".into(), vec![1]).is_err());
+        assert!(engine.search(1, "Original".into(), vec![]).is_err());
+        engine.close();
+        assert!(engine.search(2, "Original".into(), vec![]).is_err());
+    }
+
+    #[test]
+    fn page_zero_is_rejected_without_stopping_the_worker() {
+        let engine = engine();
+        engine.load(1, fixture(), None).unwrap();
+        assert_eq!(engine.text_runs(1, 0).unwrap_err(), "Invalid page.");
+        assert_eq!(page_text(&engine, 1, 1), "Original page 1");
     }
 
     #[test]
