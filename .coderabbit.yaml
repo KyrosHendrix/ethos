@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+reviews:
+  profile: assertive
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - ".*"
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+  path_filters:
+    - "!src-tauri/pdfium/**"
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        This is a Windows-only Rust workspace using Tauri, Leptos/WASM, and PDFium.
+        Prioritize correctness, data loss, security, and regressions over style.
+        Original PDFs must remain unchanged. Validate file paths and IPC inputs.
+        Check PDFium thread ownership, cancellation, and document lifetime safety.
+        Redaction must remove underlying content, not just cover it visually.
+        Prefer observable workflow tests and do not weaken assertions to pass checks.
